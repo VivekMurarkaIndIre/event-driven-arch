@@ -53,6 +53,9 @@ npm run eb:put                # put two test events to campaign-bus (one survey,
 npm run dlq:monitor           # DlqMonitor — watch all 4 DLQs, emit structured JSON alerts
 npm run dlq:replay -- <dlq>   # replayDlq — drain a named DLQ back into the main queue
 
+# Multi-tenant fairness simulation (self-contained — creates and deletes its own queue)
+npm run noisy-neighbour       # simulate 100-msg burst from one tenant vs two normal tenants; shows per-tenant rate limiting and concurrency cap
+
 # Tests
 npm test                      # run vitest in watch mode
 npm run test -- --run         # run vitest once (CI mode)

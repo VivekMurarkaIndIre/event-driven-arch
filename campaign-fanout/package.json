@@ -13,6 +13,7 @@
     "consume": "tsx src/scripts/consume.ts",
     "consume:email": "tsx src/scripts/consume-email.ts",
     "consume:notification": "tsx src/scripts/consume-notification.ts",
+    "noisy-neighbour": "tsx src/scripts/noisyNeighbour.ts",
     "consume:survey": "tsx src/scripts/consume-survey.ts",
     "consume:high-volume": "tsx src/scripts/consume-high-volume.ts",
     "eb:put": "tsx src/scripts/put-event.ts",

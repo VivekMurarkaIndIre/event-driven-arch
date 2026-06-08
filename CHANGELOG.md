@@ -8,6 +8,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased] — 2026-06-08
 
 ### Added
+- `src/lib/semaphore.ts`: counting `Semaphore` class — FIFO waiter queue, `acquire()` / `release()`, `available` and `queueDepth` accessors; used by `BaseConsumer` to cap per-tenant in-flight concurrency
+- `src/lib/tenantRateLimiter.ts`: `TenantRateLimiter` — token-bucket rate limiter with one bucket per tenant, lazily created; `acquire(tenantId)` blocks for exactly the time needed to refill the next token; `getMetrics()` returns per-tenant processed counts; includes a large top-of-file comment covering all three multi-tenant isolation strategies (per-tenant queues, per-tier queues, weighted fair queuing in consumer) with tradeoffs for each
+- `src/scripts/noisyNeighbour.ts`: self-contained simulation — creates `noisy-neighbour-test` SQS queue, publishes 100 messages for `tenant-a` and 10 each for `tenant-b`/`tenant-c` in 10 interleaved rounds, then consumes with `maxConcurrentPerTenant: 2` and `TenantRateLimiter(20 msg/s, burst 5)`; logs a progress table every 2 s and a final per-tenant throughput report showing all tenants capped at the same rate while `tenant-b`/`tenant-c` complete ~4.5 s before `tenant-a`; deletes the test queue on exit
+- `npm run noisy-neighbour` script
+
+### Changed
+- `src/consumers/BaseConsumer.ts`: added `maxConcurrentPerTenant?: number` to `ConsumerConfig`; added `protected extractTenantId(_body: TBody): string` (default `"default"`) for subclasses to supply a tenant key; added `private tenantSemaphores: Map<string, Semaphore>`; modified `poll()` — when `maxConcurrentPerTenant` is set, fans the batch out as `Promise.all` with per-message semaphore acquire/release and individual error containment; original batch-at-once path unchanged when option is unset
+
+---
+
+## [Unreleased] — 2026-06-08
+
+### Added
 - `src/infra/setup.ts`: `createEventBridgeRulesAndQueues()` provisions `campaign-survey` + `campaign-high-volume` queues (each with DLQ), then creates two EventBridge rules on `campaign-bus` — `route-survey-campaigns` (matches `detail.campaignType = "survey"`) and `route-high-volume-campaigns` (matches `detail.audienceSize > 10000`) — and links each rule to its target queue via `PutTargets`; large comment block explaining EB vs SNS filter differences, 256 KB limit, 10K/s quota, and rule independence
 - `src/publisher/eventBridgePublisher.ts`: `putCampaignEvent()` — single-entry `PutEvents` call with `FailedEntryCount` guard; includes comprehensive comment covering EB pattern operators, partial failure semantics, and when to choose EB over SNS
 - `src/consumers/surveyConsumer.ts`: `SurveyConsumer extends BaseConsumer<CampaignPublished>` — processes survey campaigns routed by EventBridge; in-memory idempotency; 30 s visibility timeout

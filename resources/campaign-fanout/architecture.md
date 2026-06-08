@@ -164,6 +164,21 @@ for fast processors; increase per-queue as processing time grows.
 
 ---
 
+### 2026-06-08 — Per-tenant concurrency cap and rate limiting (noisy-neighbour mitigation)
+
+**Decision:** Add `maxConcurrentPerTenant?: number` to `ConsumerConfig` and a `TenantRateLimiter` (token bucket) as separate, composable fairness mechanisms rather than one monolithic "fair queue" abstraction.
+
+**Why:** Concurrency cap (semaphore) and throughput cap (token bucket) solve different problems and are often needed independently. A semaphore alone limits how many messages from tenant-a are in-flight simultaneously but does not cap their rate — with a fast processor, 2 concurrent slots can still process 200 msg/s. A token bucket alone caps throughput but does not prevent 10 messages from the same tenant from all starting at once and saturating I/O (database connections, HTTP sockets). Together they model the full constraint: at most N in-flight and at most R completions per second, per tenant.
+
+Keeping them separate means existing consumers (EmailConsumer, AnalyticsConsumer) opt in by setting `maxConcurrentPerTenant` in their config and calling `rateLimiter.acquire()` in their `processMessageBatch` — no changes to their logic or constructor. Consumers that don't need fairness (e.g. a low-volume audit queue) pay zero overhead.
+
+**Trade-offs:**
+- The token bucket is per-consumer-instance. With N consumer replicas, a tenant can drive N × maxRatePerSecond total. For truly global rate limiting the bucket state must be externalised (Redis INCR+EXPIRE with Lua atomicity).
+- `maxConcurrentPerTenant` changes the calling convention of `processMessageBatch`: from "receive the full batch at once" to "receive one message per call, called concurrently." Subclasses that rely on cross-message batch operations (e.g. DynamoDB BatchWrite across 10 messages) would need to override `extractTenantId` to return a constant key, collapsing per-tenant into global, to restore the batch-at-once behaviour.
+- In-process throttle delays hold a SQS visibility slot open. At 1 msg/s rate limit with a 30 s visibility timeout, a message can spend up to 29 s waiting inside the consumer before its work starts — almost exhausting the window before the actual operation begins. Size `visibilityTimeout` relative to `1/maxRatePerSecond + expected_processing_time`.
+
+---
+
 ### 2026-06-08 — EventBridge content-based routing (survey + high-volume queues)
 
 **Decision:** Add two EventBridge rules on `campaign-bus` routing to dedicated SQS queues: `route-survey-campaigns` (matches `detail.campaignType = "survey"`) and `route-high-volume-campaigns` (matches `detail.audienceSize > 10000`). `SurveyConsumer` and `HighVolumeConsumer` read from these queues.

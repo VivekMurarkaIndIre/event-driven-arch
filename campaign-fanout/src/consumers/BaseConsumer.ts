@@ -5,6 +5,7 @@ import {
   ChangeMessageVisibilityBatchCommand,
   type Message,
 } from "@aws-sdk/client-sqs";
+import { Semaphore } from "../lib/semaphore.js";
 
 // Returned by processMessageBatch for each message that failed processing.
 // itemIdentifier must be the SQS MessageId of the failing message.
@@ -40,6 +41,18 @@ export interface ConsumerConfig {
   // Seconds a received message stays hidden from other consumers.
   // Also controls the extension loop interval (fires at visibilityTimeout / 2).
   readonly visibilityTimeout: number;
+  // Maximum number of messages from a single tenant that may be processed
+  // concurrently within one poll cycle. When set, the poll loop fans the batch
+  // out as individual concurrent tasks; each task acquires that tenant's
+  // semaphore before calling processMessageBatch([msg]).
+  //
+  // Messages from different tenants always proceed independently — only same-tenant
+  // concurrency is capped. Override extractTenantId() to identify tenants;
+  // the default implementation returns "default", making this a global cap.
+  //
+  // When unset (default), processMessageBatch receives the full batch at once
+  // and the subclass controls all concurrency internally.
+  readonly maxConcurrentPerTenant?: number;
 }
 
 // SNS wraps the original event payload in an outer JSON object when it delivers
@@ -79,6 +92,9 @@ function isEventBridgeEnvelope(value: unknown): value is EventBridgeEnvelope {
 
 export abstract class BaseConsumer<TBody> {
   private running = false;
+  // One semaphore per observed tenant id. Created lazily on first message from
+  // each tenant. Only populated when maxConcurrentPerTenant is configured.
+  private readonly tenantSemaphores = new Map<string, Semaphore>();
 
   constructor(
     protected readonly sqs: SQSClient,
@@ -88,9 +104,32 @@ export abstract class BaseConsumer<TBody> {
   // Subclasses implement business logic for a received batch.
   // Return a BatchItemFailure for every message that could not be processed.
   // Messages not in the failure list are deleted from the queue on return.
+  //
+  // When maxConcurrentPerTenant is set the base class calls this method with
+  // a single-message array per message (each wrapped in its tenant's semaphore).
+  // Subclasses that do batch operations (e.g. DynamoDB BatchWrite) should be
+  // aware that with per-tenant limiting they receive one message at a time.
   abstract processMessageBatch(
     messages: ParsedMessage<TBody>[],
   ): Promise<BatchItemFailure[]>;
+
+  // Override to enable per-tenant concurrency capping when maxConcurrentPerTenant
+  // is set. Return a stable string that uniquely identifies the tenant for a given
+  // message body. The default "default" collapses all messages into one semaphore,
+  // acting as a global concurrency cap.
+  protected extractTenantId(_body: TBody): string {
+    return "default";
+  }
+
+  private getOrCreateSemaphore(tenantId: string): Semaphore {
+    let sem = this.tenantSemaphores.get(tenantId);
+    if (sem === undefined) {
+      // maxConcurrentPerTenant is guaranteed defined at call sites.
+      sem = new Semaphore(this.config.maxConcurrentPerTenant as number);
+      this.tenantSemaphores.set(tenantId, sem);
+    }
+    return sem;
+  }
 
   async start(): Promise<void> {
     this.running = true;
@@ -158,10 +197,43 @@ export abstract class BaseConsumer<TBody> {
 
     let failures: BatchItemFailure[] = [];
     try {
-      failures = await this.processMessageBatch(messages);
+      if (this.config.maxConcurrentPerTenant !== undefined) {
+        // Fan the batch out as individual concurrent tasks. Each task acquires
+        // its tenant's semaphore before calling processMessageBatch([msg]), so
+        // at most maxConcurrentPerTenant messages from the same tenant run at once.
+        // Messages from different tenants proceed independently — a noisy tenant
+        // can only block itself, not its neighbours.
+        //
+        // processMessageBatch is called with a single-message array; subclasses
+        // that iterate with for...of are unaffected. Subclasses relying on batch
+        // operations across messages (e.g. DynamoDB BatchWrite) should override
+        // extractTenantId to return the same key for all messages, which collapses
+        // the per-tenant cap into a global concurrency cap and preserves batching.
+        const results = await Promise.all(
+          messages.map(async (msg) => {
+            const tenantId = this.extractTenantId(msg.body);
+            const sem = this.getOrCreateSemaphore(tenantId);
+            await sem.acquire();
+            try {
+              return await this.processMessageBatch([msg]);
+            } catch (err) {
+              console.error(
+                `[${this.constructor.name}] unhandled error for ${msg.messageId}:`, err,
+              );
+              return [{ itemIdentifier: msg.messageId }];
+            } finally {
+              sem.release();
+            }
+          }),
+        );
+        failures = results.flat();
+      } else {
+        failures = await this.processMessageBatch(messages);
+      }
     } catch (err) {
-      // Unexpected throw from processMessageBatch: treat every message as
-      // failed so none are deleted. They re-appear after the visibility timeout.
+      // Unexpected throw outside the per-message paths above (e.g. Promise.all
+      // itself, which cannot happen when each map callback catches its own errors).
+      // Kept as a safety net so a bug here doesn't silently delete messages.
       console.error(`[${this.constructor.name}] unhandled batch error:`, err);
       failures = messages.map((m) => ({ itemIdentifier: m.messageId }));
     } finally {
