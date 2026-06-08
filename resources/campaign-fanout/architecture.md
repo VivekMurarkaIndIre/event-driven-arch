@@ -193,3 +193,15 @@ A survey campaign with `audienceSize > 10000` matches both rules simultaneously 
 - `PutEvents` partial failure: `FailedEntryCount > 0` does not throw — it must be checked explicitly. The publisher guards on this and throws, but callers must handle the re-throw.
 - EventBridge delivers asynchronously with sub-second typical latency; SNS is synchronous at the broker (though SQS polling still adds latency). For time-sensitive routing, SNS + attribute-based filters are lower-latency.
 - `HighVolumeConsumer` uses 60 s visibility timeout vs. 30 s for other consumers — reflects the assumption that high-volume campaigns take longer to process. If processing routinely exceeds 60 s, the visibility extension loop in `BaseConsumer` (fires at 30 s) will renew it; if it exceeds the first renewal window without completing, increase `visibilityTimeout` in the constructor.
+
+---
+
+### 2026-06-09 — Complete architecture SVG and structured README testing guide
+
+**Decision:** Add `resources/campaign-fanout/complete_architecture_module8.svg` as the canonical visual overview of the campaign-fanout system, and embed it in the root README alongside a colour guide and narrative walkthrough. Restructure the README's Quick Start and Commands sections into named testing flows with per-flow terminal layouts, expected output snippets, and a 6-terminal full-layout table.
+
+**Why:** As the system grew across eight modules (SNS fan-out, FIFO ordering, DLQ tooling, EventBridge routing, semaphore + rate limiter), a plain command list was no longer sufficient for onboarding. The SVG makes the relationship between transports, queues, and cross-cutting concerns (idempotency, fairness, DLQ replay) visible at a glance. The named-flow README structure answers "which terminals do I need open?" for each feature independently rather than requiring the reader to understand the whole system first.
+
+**Trade-offs:**
+- SVG in the repo adds ~50 KB but renders directly in GitHub/VS Code without a separate tool. An alternative (Mermaid in markdown) would be version-controlled text but lacks the visual density needed to show all seven components (publisher, three transports, consumers, DynamoDB, operational tooling) clearly.
+- Named-flow sections in the README duplicate some information present in script comments. The duplication is acceptable because the README is the entry point for a reader who hasn't yet opened any source files.

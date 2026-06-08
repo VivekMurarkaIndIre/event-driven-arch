@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased] — 2026-06-09
+
+### Added
+- `resources/campaign-fanout/complete_architecture_module8.svg`: complete architecture diagram covering all modules — Publisher → SNS standard / FIFO / EventBridge → all SQS queues with DLQs, `BaseConsumer` box with Semaphore and rate limiter, DynamoDB idempotency store, DLQ monitor, and replay script; colour-coded by transport type
+- `README.md` architecture section: embeds the SVG, adds a colour-guide table (green/purple/orange-red/amber/blue/pink), and a numbered narrative reading the diagram left → right
+
+### Changed
+- `README.md` Quick Start and Commands sections restructured into named testing flows (SNS fan-out, EventBridge routing, DLQ tooling, noisy-neighbour) with per-flow terminal layouts, expected output snippets, and a 6-terminal full-layout table showing which consumers respond to which publish commands
+
+---
+
 ## [Unreleased] — 2026-06-08
 
 ### Added
