@@ -8,6 +8,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased] — 2026-06-08
 
 ### Added
+- `src/consumers/BaseConsumer.ts`: abstract generic SQS consumer with long polling (`WaitTimeSeconds: 20`), configurable batch size, visibility timeout extension loop (fires at `visibilityTimeout / 2`), SNS envelope unwrapping, partial batch response (`batchItemFailures`), and graceful error containment
+- `src/lib/idempotency.ts`: `InMemoryIdempotencyStore` and `makeIdempotencyKey(messageId, eventId)` — composite key covering both SQS re-deliveries and producer-level retry duplicates
+- `src/consumers/analyticsConsumer.ts`: `AnalyticsConsumer extends BaseConsumer<CampaignPublished>` with runtime Zod re-validation, idempotency guard, and `createAnalyticsConsumer` factory
+- `src/scripts/consume.ts`: runnable consumer script with `SIGINT` handler for graceful shutdown
+- `npm run consume` script in `package.json`
+
+---
+
+## [Unreleased] — 2026-06-08
+
+### Added
 - `src/events/schemas.ts`: Zod schema (`CampaignPublishedSchema`) and inferred TypeScript type for the `CampaignPublished` event, covering `campaignId`, `tenantId`, `tenantTier`, `campaignType`, `audienceSize`, `correlationId`, and `publishedAt`
 - `src/publisher/campaignPublisher.ts`: SNS publisher function with `tenantId`, `tenantTier`, and `eventType` as message attributes; SHA-256 deduplication ID computed from `campaignId + version`; detailed comment explaining standard-vs-FIFO deduplication behaviour
 - `src/scripts/publish.ts`: runnable test script that validates a payload through Zod before publishing

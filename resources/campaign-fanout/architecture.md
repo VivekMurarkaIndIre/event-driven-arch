@@ -75,3 +75,30 @@ concern, not a replacement.
 **Why:** 5 retries gives transient failures (network blips, cold starts) a fair chance while
 preventing poison messages from looping indefinitely. 30s visibility timeout is a safe default
 for fast processors; increase per-queue as processing time grows.
+
+---
+
+### 2026-06-08 — Consumer layer: BaseConsumer, idempotency, partial batch response
+
+**Decision:** Implement SQS polling mechanics once in an abstract `BaseConsumer<TBody>` rather than repeating them in each consumer.
+
+**Why:** All SQS consumers share the same ceremony — long polling, visibility extension, batch deletion, SNS envelope unwrapping, error containment. Centralising this lets concrete consumers focus entirely on business logic (`processMessageBatch`). Changes to the polling strategy (e.g. tuning the extension interval, adding tracing) propagate to all consumers automatically.
+
+**Trade-offs:**
+- The base class becomes a load-bearing abstraction; bugs in it affect every consumer simultaneously. Mitigate with integration tests that exercise the base class against LocalStack.
+- Generic `TBody` relies on a `JSON.parse(...) as TBody` cast, which is not type-safe at runtime. Concrete consumers must re-validate with Zod on receive; the TypeScript type is a documentation aid, not a runtime guarantee.
+
+**Decision:** Composite idempotency key = `messageId:eventId`.
+
+**Why:** Neither component alone is sufficient. `messageId` (the SQS envelope ID) deduplicates re-deliveries of the same physical message (crash-before-delete, rare SQS duplicate). `eventId` (the business ID, e.g. `campaignId`) deduplicates producer-level retries where a fresh publish produces a new `messageId` carrying the same business event. Both are needed to cover all realistic duplicate scenarios.
+
+**Trade-offs:**
+- The in-memory store is only safe for single-process consumers. Multiple replicas each deduplicate only their own history. Production replacement: DynamoDB conditional write (`attribute_not_exists(pk)`), which is atomic, durable, and shared across all replicas.
+- Memory grows unboundedly in the current implementation. A production store must evict keys older than the SQS message retention period.
+
+**Decision:** Return `BatchItemFailure[]` from `processMessageBatch` (partial batch response) rather than treating the whole batch as pass/fail.
+
+**Why:** A binary outcome forces an untenable choice when one message in a ten-message batch fails: delete all (silently drop the failed message) or delete none (re-deliver the nine messages that already succeeded). Per-message failure reporting lets SQS retry exactly the failing messages while deleting the successes, giving each message its own independent retry lifecycle up to `maxReceiveCount`, then DLQ.
+
+**Trade-offs:**
+- Callers must not return a failure for a message they partially processed — that would re-deliver a message whose side effects are already partially applied. All side effects must be atomic or idempotent before returning success.

@@ -75,3 +75,32 @@
   in the script that assembles the raw object (not in the publisher function) means the
   publisher receives a typed `CampaignPublished` value — no `unknown` casting, no runtime
   guards inside a function that is supposed to be a pure transport concern.
+
+### 2026-06-08
+- **`tsx --eval` with top-level await fails with CJS output format.** `tsx --eval` defaults to
+  CommonJS, which does not support top-level `await`. The error is:
+  `Top-level await is currently not supported with the "cjs" output format`.
+  Fix: put the code in a `.ts` file (picked up as ESM by `"type": "module"` in package.json)
+  and run it with `npx tsx src/scripts/file.ts`. Never use `--eval` for async entry points.
+
+- **SNS wraps the payload in an envelope when delivering to SQS.** The SQS message body is
+  not the raw event JSON — it is an outer JSON object with `{ "Type": "Notification", "Message": "<inner JSON string>", ... }`. The inner payload lives in `Message`. Any consumer
+  that does `JSON.parse(sqs.Body)` and expects the event directly will get the envelope object
+  instead. The fix (implemented in `BaseConsumer.parseMessages`) is to detect `Type === "Notification"` and parse `Message` as the actual payload.
+
+- **Visibility timeout extension interval must be strictly less than the timeout itself.**
+  `ChangeMessageVisibilityBatch` resets the deadline to `visibilityTimeout` seconds *from now*.
+  If the extension fires after the deadline has already expired, the message is already visible
+  to other consumers — `ChangeMessageVisibility` on an expired message returns
+  `InvalidParameterValue`. The safe interval is `visibilityTimeout / 2`, ensuring the timer
+  always fires while at least half the timeout remains.
+
+- **Mark processed AFTER the write succeeds, not before.** If you add the idempotency key
+  before the downstream write and then crash mid-write, the key exists but the side effect
+  never happened — the message is permanently lost with no retry possible. Mark after success
+  so a crash leaves the key absent, the message re-delivers, and the write is retried.
+
+- **`for...of` over a typed array is safe under `noUncheckedIndexedAccess`.** The flag adds
+  `| undefined` only to index-signature access (`arr[i]`), not to `for...of` iteration
+  variables. Iterating with `for (const item of arr)` gives `item: T`, not `item: T | undefined`,
+  so no extra guards are needed inside loop bodies.

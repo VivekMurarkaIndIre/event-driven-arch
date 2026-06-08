@@ -9,6 +9,7 @@
   "scripts": {
     "infra:setup": "tsx src/infra/setup.ts",
     "publish": "tsx src/scripts/publish.ts",
+    "consume": "tsx src/scripts/consume.ts",
     "test": "vitest"
   },
   "dependencies": {

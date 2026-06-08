@@ -39,8 +39,9 @@ npm install                   # install all packages
 # AWS resource provisioning
 npm run infra:setup           # create SNS topics, SQS queues + DLQs, EventBridge buses, DynamoDB tables
 
-# Publishing
+# Publishing / consuming
 npm run publish               # publish a test CampaignPublished event to SNS via LocalStack
+npm run consume               # start the AnalyticsConsumer (long-polls campaign-analytics queue)
 
 # Tests
 npm test                      # run vitest in watch mode
