@@ -8,6 +8,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased] — 2026-06-08
 
 ### Added
+- `campaign-fanout/docs/messaging-decision.md`: comparison of SNS, SQS, EventBridge, Kinesis, and Kafka across delivery guarantee, ordering, replay, consumer model, throughput ceiling, and operational overhead
+- `campaign-fanout/docs/decision-tree.md`: ASCII decision tree selecting a service given tenant count, message rate, ordering, replay, and content-routing requirements; includes scoring table and applied example for campaign-fanout
+- Inline comments throughout `src/infra/setup.ts` explaining why each service is used (SNS as broadcast hub, SQS per-consumer queue rationale, DLQ sequencing constraint, EventBridge as complement for content routing, DynamoDB key design)
+
+### Fixed
+- Added `"types": ["node"]` to `tsconfig.json` — `lib: ["ES2022"]` does not pull in Node.js globals; without this, `console` is unresolved under strict type checking
+
+---
+
+## [Unreleased] — 2026-06-08
+
+### Added
 - `campaign-fanout` project: TypeScript monorepo scaffold with strict tsconfig
 - LocalStack `docker-compose.yml` running SNS, SQS, EventBridge, and DynamoDB
 - `src/infra/setup.ts` provisioning all AWS resources via SDK v3 against `http://localhost:4566`

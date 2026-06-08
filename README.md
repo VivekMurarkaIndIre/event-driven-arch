@@ -58,5 +58,7 @@ Architecture decisions, learnings, and business context live in [`resources/`](r
 | [resources/campaign-fanout/architecture.md](resources/campaign-fanout/architecture.md) | Infrastructure layout, service choices, design decisions |
 | [resources/campaign-fanout/learnings.md](resources/campaign-fanout/learnings.md) | Key learnings, gotchas, TypeScript/SDK insights |
 | [resources/campaign-fanout/business-context.md](resources/campaign-fanout/business-context.md) | Problem statement, use case, pros/cons |
+| [campaign-fanout/docs/messaging-decision.md](campaign-fanout/docs/messaging-decision.md) | SNS vs SQS vs EventBridge vs Kinesis vs Kafka comparison |
+| [campaign-fanout/docs/decision-tree.md](campaign-fanout/docs/decision-tree.md) | Decision tree: pick a service given rate, ordering, replay, routing requirements |
 
 These files are updated on every `/commit`.
