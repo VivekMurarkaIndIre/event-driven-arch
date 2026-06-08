@@ -39,6 +39,9 @@ npm install                   # install all packages
 # AWS resource provisioning
 npm run infra:setup           # create SNS topics, SQS queues + DLQs, EventBridge buses, DynamoDB tables
 
+# Publishing
+npm run publish               # publish a test CampaignPublished event to SNS via LocalStack
+
 # Tests
 npm test                      # run vitest in watch mode
 npm run test -- --run         # run vitest once (CI mode)

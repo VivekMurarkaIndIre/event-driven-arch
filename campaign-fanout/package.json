@@ -8,13 +8,15 @@
   ],
   "scripts": {
     "infra:setup": "tsx src/infra/setup.ts",
+    "publish": "tsx src/scripts/publish.ts",
     "test": "vitest"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.0.0",
     "@aws-sdk/client-eventbridge": "^3.0.0",
     "@aws-sdk/client-sns": "^3.0.0",
-    "@aws-sdk/client-sqs": "^3.0.0"
+    "@aws-sdk/client-sqs": "^3.0.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

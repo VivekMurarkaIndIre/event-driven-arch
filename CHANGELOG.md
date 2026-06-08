@@ -8,6 +8,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased] — 2026-06-08
 
 ### Added
+- `src/events/schemas.ts`: Zod schema (`CampaignPublishedSchema`) and inferred TypeScript type for the `CampaignPublished` event, covering `campaignId`, `tenantId`, `tenantTier`, `campaignType`, `audienceSize`, `correlationId`, and `publishedAt`
+- `src/publisher/campaignPublisher.ts`: SNS publisher function with `tenantId`, `tenantTier`, and `eventType` as message attributes; SHA-256 deduplication ID computed from `campaignId + version`; detailed comment explaining standard-vs-FIFO deduplication behaviour
+- `src/scripts/publish.ts`: runnable test script that validates a payload through Zod before publishing
+- `npm run publish` script in `package.json`
+- `zod` added as a production dependency
+
+---
+
+## [Unreleased] — 2026-06-08
+
+### Added
 - `campaign-fanout/docs/messaging-decision.md`: comparison of SNS, SQS, EventBridge, Kinesis, and Kafka across delivery guarantee, ordering, replay, consumer model, throughput ceiling, and operational overhead
 - `campaign-fanout/docs/decision-tree.md`: ASCII decision tree selecting a service given tenant count, message rate, ordering, replay, and content-routing requirements; includes scoring table and applied example for campaign-fanout
 - Inline comments throughout `src/infra/setup.ts` explaining why each service is used (SNS as broadcast hub, SQS per-consumer queue rationale, DLQ sequencing constraint, EventBridge as complement for content routing, DynamoDB key design)

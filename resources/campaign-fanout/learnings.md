@@ -49,3 +49,29 @@
   EventBridge is filter-then-route. A single event can be published to both: SNS fans
   out to all consumers, EventBridge carries it to conditional targets (e.g. billing only
   on `campaign-activated`). The two patterns compose; you don't choose one over the other.
+
+### 2026-06-08
+- **Zod `z.string().datetime()` rejects `Date` objects.** The schema must receive an ISO-8601
+  string (`new Date().toISOString()`), not a raw `Date`. This is intentional: JSON has no
+  native date type, and forcing an explicit string eliminates silent timezone or millisecond
+  precision differences between serializers.
+
+- **SNS rejects `MessageDeduplicationId` on standard topics.** Only FIFO topics honour the
+  field; passing it to a standard `PublishCommand` returns an `InvalidParameter` error. The
+  dedup key is still worth computing and logging — use it as the idempotency key in the
+  consumer's DynamoDB conditional write (`attribute_not_exists(deduplicationId)`).
+
+- **SNS message attributes vs. message body.** Attributes are indexed by SNS and evaluated
+  by subscription filter policies *before* delivery. Body content is opaque to the broker.
+  Any field you want to filter on at the queue subscription layer must be in attributes —
+  even if it duplicates a body field. The body remains the authoritative source of truth.
+
+- **`node:crypto` is the right import specifier for Node built-ins with `module: NodeNext`.**
+  The bare `"crypto"` specifier works but the `node:` prefix makes it explicit that this is
+  a Node.js built-in, not an npm package, and avoids shadowing by a hypothetically installed
+  `crypto` package. TypeScript resolves both identically given `"types": ["node"]`.
+
+- **Validate at the producer boundary, not in the transport layer.** Putting `schema.parse()`
+  in the script that assembles the raw object (not in the publisher function) means the
+  publisher receives a typed `CampaignPublished` value — no `unknown` casting, no runtime
+  guards inside a function that is supposed to be a pure transport concern.
