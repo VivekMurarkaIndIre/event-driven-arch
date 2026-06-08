@@ -13,6 +13,8 @@
     "consume": "tsx src/scripts/consume.ts",
     "consume:email": "tsx src/scripts/consume-email.ts",
     "consume:notification": "tsx src/scripts/consume-notification.ts",
+    "dlq:monitor": "tsx src/consumers/dlqMonitor.ts",
+    "dlq:replay": "tsx src/scripts/replayDlq.ts",
     "test": "vitest"
   },
   "dependencies": {

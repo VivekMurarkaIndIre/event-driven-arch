@@ -115,3 +115,14 @@
 - **LocalStack `ResourceAlreadyExistsException` vs `ResourceInUseException`.** EventBridge throws `ResourceAlreadyExistsException`; DynamoDB throws `ResourceInUseException`. The error names are inconsistent across services — check the `err.name` field rather than the message string, and handle each service separately.
 
 - **SNS `CreateTopic` and SQS `CreateQueue` are idempotent by the AWS API contract.** Calling them with the same name when the resource already exists returns the existing ARN/URL rather than an error. This makes topics and queues easy to provision safely on every deploy without explicit existence checks. EventBridge and DynamoDB do not share this property.
+
+### 2026-06-08
+- **SQS `CreateQueue` idempotency is attribute-exact, not just name-exact.** If any attribute (e.g. `RedrivePolicy.maxReceiveCount`) differs from the existing queue, SQS throws `QueueNameExists` rather than returning the existing URL. The only safe "upsert" pattern is: try `CreateQueue`, catch `QueueNameExists`, then call `GetQueueUrl` + `SetQueueAttributes` to update the existing queue in place.
+
+- **SQS DLQ peek pattern: `ReceiveMessage(VisibilityTimeout: 5)` + `ChangeMessageVisibilityBatch(0)`.** To inspect DLQ messages without consuming them, receive with a short visibility timeout and immediately change it back to 0. This is the only way to read message content from SQS without deleting it — `GetQueueAttributes` gives you the count but not the body. The 5-second window is a race window; keep it as short as possible.
+
+- **`maxReceiveCount: 1` fills DLQs with noise.** Any transient failure (network blip, cold start, process restart mid-batch) immediately DLQs the message. The DLQ then mixes noise with genuine failures, making `ApproximateNumberOfMessages > 0` an unreliable alert. Setting `maxReceiveCount ≥ 3` filters transient failures before they reach the DLQ, making the count a reliable signal — alert on 1, not on some higher threshold.
+
+- **DLQ replay should target the main SQS queue directly, not SNS.** Re-publishing through SNS fans the message out to every subscribed queue, turning a single-queue replay into a broadcast. Publishing directly to the main SQS queue (`SendMessageCommand`) re-queues the message exactly where it failed, with all original attributes preserved plus a new `replayedAt` marker.
+
+- **`replayedAt` message attribute breaks infinite DLQ replay loops.** On replay, add `replayedAt: ISO timestamp` to the SQS `MessageAttributes`. If the replayed message fails again and lands back in the DLQ, it carries this attribute. The replay script detects it and skips rather than re-queuing indefinitely. A twice-failed message needs manual investigation, not another automated replay.

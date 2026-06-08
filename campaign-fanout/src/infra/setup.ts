@@ -2,7 +2,9 @@ import { SNSClient, CreateTopicCommand, SubscribeCommand } from "@aws-sdk/client
 import {
   SQSClient,
   CreateQueueCommand,
+  GetQueueUrlCommand,
   GetQueueAttributesCommand,
+  SetQueueAttributesCommand,
 } from "@aws-sdk/client-sqs";
 import {
   EventBridgeClient,
@@ -101,6 +103,32 @@ async function createSnsTopics(): Promise<Map<string, string>> {
 //   - Zero operational overhead vs. shard management (Kinesis) or broker ops (Kafka).
 // ---------------------------------------------------------------------------
 
+// SQS CreateQueue is idempotent only when every attribute is identical to the
+// existing queue. Changing any attribute (e.g. maxReceiveCount in RedrivePolicy)
+// throws QueueNameExists instead of returning the existing URL.
+// This helper handles that case: on QueueNameExists, resolve the existing URL
+// and apply the desired attributes via SetQueueAttributes so infra:setup is safe
+// to re-run after any configuration change.
+async function ensureQueue(
+  queueName: string,
+  attributes: Record<string, string>,
+): Promise<string> {
+  try {
+    const { QueueUrl } = await sqs.send(
+      new CreateQueueCommand({ QueueName: queueName, Attributes: attributes }),
+    );
+    if (!QueueUrl) throw new Error(`No QueueUrl returned for: ${queueName}`);
+    return QueueUrl;
+  } catch (err) {
+    if ((err as { name?: string }).name !== "QueueNameExists") throw err;
+    // Queue exists with different attributes — resolve URL and update in place.
+    const { QueueUrl } = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
+    if (!QueueUrl) throw new Error(`Could not resolve URL for: ${queueName}`);
+    await sqs.send(new SetQueueAttributesCommand({ QueueUrl, Attributes: attributes }));
+    return QueueUrl;
+  }
+}
+
 async function createSqsQueuesWithDlqs(): Promise<Map<string, string>> {
   console.log("\nCreating SQS queues + DLQs...");
   const queueArns = new Map<string, string>();
@@ -109,15 +137,9 @@ async function createSqsQueuesWithDlqs(): Promise<Map<string, string>> {
     const dlqName = `${name}-dlq`;
 
     // 1. Create DLQ first — its ARN is required before the main queue can be created.
-    const { QueueUrl: dlqUrl } = await sqs.send(
-      new CreateQueueCommand({
-        QueueName: dlqName,
-        Attributes: {
-          MessageRetentionPeriod: "1209600", // 14 days — long enough to investigate failures
-        },
-      }),
-    );
-    if (!dlqUrl) throw new Error(`No QueueUrl returned for DLQ: ${dlqName}`);
+    const dlqUrl = await ensureQueue(dlqName, {
+      MessageRetentionPeriod: "1209600", // 14 days — long enough to investigate failures
+    });
 
     // 2. Resolve DLQ ARN — RedrivePolicy requires the ARN, not the URL.
     //    GetQueueAttributes must be called explicitly; CreateQueue does not return it.
@@ -131,24 +153,43 @@ async function createSqsQueuesWithDlqs(): Promise<Map<string, string>> {
     if (!dlqArn) throw new Error(`Could not retrieve ARN for DLQ: ${dlqName}`);
 
     // 3. Create main queue with a redrive policy pointing at the DLQ.
-    //    maxReceiveCount=5: tolerate transient failures (network blips, cold starts)
-    //    while preventing a poison message from looping indefinitely.
+    //
+    // maxReceiveCount = 3: why not 1, and what is the right alerting threshold?
+    //
+    //   maxReceiveCount: 1 is dangerous:
+    //     A single transient failure — network timeout, cold start, downstream 503,
+    //     or a consumer process restart mid-batch — immediately DLQs the message.
+    //     No retry window, no self-healing. Under partial batch response, one bad
+    //     message in a ten-message batch exhausts its sole receive attempt on the
+    //     very first error. DLQ depth becomes useless as a health signal because
+    //     it fills with noise from transient failures, making it impossible to tell
+    //     a genuine processing bug from a blip.
+    //
+    //   maxReceiveCount: 3 provides:
+    //     Two soft retries before a definitive failure. A message that lands in the
+    //     DLQ on the third receive has survived two separate delivery attempts —
+    //     transient failures self-heal before that point. The DLQ then contains only
+    //     messages the consumer genuinely cannot process (schema mismatch, downstream
+    //     outage longer than retry window, poison-pill data).
+    //
+    //   Safe alerting threshold:
+    //     Alert when DLQ ApproximateNumberOfMessages > 0. Each DLQ message has
+    //     already exhausted all retries and is never noise. Using a threshold of 0
+    //     is safe *because* maxReceiveCount > 1 filters transient failures before
+    //     they ever reach the DLQ. A higher threshold (e.g. > 5) risks missing
+    //     low-volume persistent failures that affect only a specific tenant or
+    //     payload shape. Alert on 1, investigate immediately.
+    //
     //    VisibilityTimeout=30s: safe default for fast processors; increase per-queue
     //    if processing time grows (timeout < processing time = duplicate delivery).
-    const { QueueUrl: mainUrl } = await sqs.send(
-      new CreateQueueCommand({
-        QueueName: name,
-        Attributes: {
-          VisibilityTimeout: "30",
-          MessageRetentionPeriod: "345600", // 4 days
-          RedrivePolicy: JSON.stringify({
-            deadLetterTargetArn: dlqArn,
-            maxReceiveCount: "5",
-          }),
-        },
+    const mainUrl = await ensureQueue(name, {
+      VisibilityTimeout: "30",
+      MessageRetentionPeriod: "345600", // 4 days
+      RedrivePolicy: JSON.stringify({
+        deadLetterTargetArn: dlqArn,
+        maxReceiveCount: "3",
       }),
-    );
-    if (!mainUrl) throw new Error(`No QueueUrl returned for queue: ${name}`);
+    });
 
     // 4. Resolve the main queue ARN — needed when creating SNS subscriptions.
     const { Attributes: mainAttrs } = await sqs.send(

@@ -8,6 +8,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased] — 2026-06-08
 
 ### Added
+- `src/consumers/dlqMonitor.ts`: `DlqMonitor` class — polls all 4 DLQs every 10 s, peeks with `VisibilityTimeout: 5`, emits one structured JSON alert per message to stdout, then releases messages back with `ChangeMessageVisibilityBatch(0)` so they immediately return to the DLQ
+- `src/scripts/replayDlq.ts`: drain-and-replay script — takes a DLQ name, derives the main queue name by stripping `-dlq`, re-queues each message to the main SQS queue with a `replayedAt` message attribute, and deletes from the DLQ only after successful `SendMessage`; skips messages that already carry `replayedAt` to prevent infinite replay loops
+- `npm run dlq:monitor` and `npm run dlq:replay -- <dlq-name>` scripts
+
+### Changed
+- `src/infra/setup.ts`: `maxReceiveCount` lowered from 5 → 3 with an expanded comment explaining why `maxReceiveCount: 1` is dangerous and that the safe alert threshold is `ApproximateNumberOfMessages > 0`
+- `src/infra/setup.ts`: SQS queue creation now goes through `ensureQueue()` helper — catches `QueueNameExists` (thrown when any attribute differs from the existing queue) and falls back to `GetQueueUrl` + `SetQueueAttributes` to update in place; `infra:setup` is now safe to re-run after any queue attribute change
+
+---
+
+## [Unreleased] — 2026-06-08
+
+### Added
 - `src/consumers/emailConsumer.ts`: `EmailConsumer` reading from `campaign-processor`; no filter — receives all tenant tiers
 - `src/consumers/notificationConsumer.ts`: `NotificationConsumer` reading from `campaign-notifier`; trusts the SNS broker filter to deliver only paid-tier events
 - `src/scripts/publishBatch.ts`: publishes 10 events with mixed `tenantTier` values (4 free, 3 pro, 3 enterprise); prints per-event routing and expected queue depths

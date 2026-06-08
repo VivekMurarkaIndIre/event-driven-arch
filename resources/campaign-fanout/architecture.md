@@ -107,6 +107,15 @@ for fast processors; increase per-queue as processing time grows.
 
 ### 2026-06-08 — SNS subscription filter policies and idempotent infra:setup
 
+**Decision:** Add `DlqMonitor` (peek-and-alert) and `replayDlq` (drain-and-replay) as operational tooling alongside the consumers.
+
+**Why:** DLQs without tooling are a data graveyard — messages accumulate silently until an operator notices metrics. `DlqMonitor` closes the alert loop: it detects depth > 0 and emits structured JSON alerts that log forwarders can consume. `replayDlq` closes the recovery loop: it re-queues messages directly into the main SQS queue (not through SNS, which would fan-out to all queues) and marks each re-queued message with `replayedAt` to prevent infinite replay loops on persistent failures.
+
+**Trade-offs:**
+- `DlqMonitor` uses `ReceiveMessage` + `ChangeMessageVisibilityBatch(0)` to peek at messages. This is the standard peek pattern but it briefly hides messages from replay scripts running concurrently. The 5-second visibility window is short enough to be acceptable.
+- `replayDlq` re-publishes to the main SQS queue directly, bypassing SNS. This means SNS filter policies don't re-apply on replay — which is intentional (the message already passed the filter when originally published) but means the operator must target the correct DLQ for the queue they want to re-populate.
+- A message that fails after replay carries `replayedAt` when it hits the DLQ again. The replay script skips it. Recovery then requires manual investigation or a schema fix before the next replay.
+
 **Decision:** Apply SNS subscription filter `{ tenantTier: ["pro", "enterprise"] }` to the `campaign-notifier` subscription; all other queue subscriptions carry no filter.
 
 **Why:** The notifier sends push/SMS notifications, a paid-tier feature. Free-tier tenants generating campaign events should never trigger notification delivery. Enforcing this at the SNS broker (before the message enters the queue) means the `NotificationConsumer` receives zero free-tier messages and incurs zero processing cost for them. The alternative — receiving all messages and skipping in the consumer — wastes ReceiveMessage API calls, increases queue depth metrics, and requires consumer logic to know about tier rules.
@@ -115,6 +124,14 @@ for fast processors; increase per-queue as processing time grows.
 - The filter operates on message *attributes*, not the body. The `tenantTier` attribute must be set at publish time (done in `campaignPublisher.ts`). Any producer that omits this attribute will have its messages filtered out entirely (SNS treats a missing attribute as non-matching), which may or may not be the desired behaviour.
 - Adding a new paid-tier value (e.g. `"enterprise-plus"`) requires updating the filter policy on the subscription, not just the schema. Infrastructure and code must stay in sync.
 - `FilterPolicyScope: "MessageAttributes"` is the default. Using `"MessageBody"` instead would allow filtering on JSON body fields but adds SNS parsing overhead and couples the filter to the body schema.
+
+**Decision:** Make `infra:setup` fully idempotent for SQS queues using an `ensureQueue` helper that catches `QueueNameExists` and falls back to `SetQueueAttributes`.
+
+**Why:** `CreateQueue` is only idempotent when all attributes match exactly. Lowering `maxReceiveCount` (or any future attribute change) throws `QueueNameExists` on re-run, leaving subscriptions uncreated. The `ensureQueue` helper resolves the existing URL and applies the desired attributes, making `infra:setup` safe to re-run after any configuration change without requiring a teardown.
+
+**Trade-offs:**
+- `SetQueueAttributes` on an existing queue with live consumers briefly changes its behaviour (e.g. a new `maxReceiveCount` takes effect for the next delivery). This is generally safe for non-destructive attribute changes like adjusting retry counts; it would be dangerous for changes like shrinking `VisibilityTimeout` below in-flight processing time.
+- `QueueNameExists` is a full-stop error from SQS, not a "soft exists" signal — the fallback path adds two extra API calls on every re-run for queues with changed attributes.
 
 **Decision:** Make `infra:setup` idempotent by catching "already exists" errors in `createEventBridgeBuses` and `createDynamoTables`.
 
