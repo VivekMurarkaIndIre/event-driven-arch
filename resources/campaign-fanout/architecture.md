@@ -161,3 +161,20 @@ for fast processors; increase per-queue as processing time grows.
 **Trade-offs:**
 - SNS `CreateTopic` and SQS `CreateQueue` are already idempotent by the AWS API contract (they return the existing resource on duplicate calls). Only EventBridge and DynamoDB required explicit error handling.
 - Idempotent `infra:setup` does not clean up stale resources from a previous schema version — that requires a separate teardown or migration step.
+
+---
+
+### 2026-06-08 — EventBridge content-based routing (survey + high-volume queues)
+
+**Decision:** Add two EventBridge rules on `campaign-bus` routing to dedicated SQS queues: `route-survey-campaigns` (matches `detail.campaignType = "survey"`) and `route-high-volume-campaigns` (matches `detail.audienceSize > 10000`). `SurveyConsumer` and `HighVolumeConsumer` read from these queues.
+
+**Why:** These routing decisions cannot be expressed with SNS filter policies, which operate only on flat `MessageAttributes`. `campaignType` could be duplicated into an attribute (as `tenantTier` was for the notifier), but `audienceSize > 10000` requires a numeric range check on a body field — that is only expressible as an EventBridge pattern. Rather than mixing attribute-based and body-based routing in SNS, EventBridge handles both dimensions cleanly from a single `PutEvents` call.
+
+A survey campaign with `audienceSize > 10000` matches both rules simultaneously — EventBridge delivers it to both target queues independently. Each queue represents a distinct downstream concern (survey tooling vs. high-throughput delivery pipeline), so the fan-out is intentional: the same event triggers different processing in parallel.
+
+**Trade-offs:**
+- EventBridge costs $1/million events entering the bus regardless of rule matches. SNS filters are free. For low-volume learning traffic this is negligible; for high-throughput production workloads the cost difference is material.
+- `PutEvents` throughput default is 10 000 events/s per region (soft limit). SNS standard has no practical throughput ceiling. If campaign event volume exceeds this, EventBridge becomes a bottleneck unless the quota is raised.
+- `PutEvents` partial failure: `FailedEntryCount > 0` does not throw — it must be checked explicitly. The publisher guards on this and throws, but callers must handle the re-throw.
+- EventBridge delivers asynchronously with sub-second typical latency; SNS is synchronous at the broker (though SQS polling still adds latency). For time-sensitive routing, SNS + attribute-based filters are lower-latency.
+- `HighVolumeConsumer` uses 60 s visibility timeout vs. 30 s for other consumers — reflects the assumption that high-volume campaigns take longer to process. If processing routinely exceeds 60 s, the visibility extension loop in `BaseConsumer` (fires at 30 s) will renew it; if it exceeds the first renewal window without completing, increase `visibilityTimeout` in the constructor.

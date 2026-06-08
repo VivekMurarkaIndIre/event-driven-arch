@@ -8,6 +8,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased] — 2026-06-08
 
 ### Added
+- `src/infra/setup.ts`: `createEventBridgeRulesAndQueues()` provisions `campaign-survey` + `campaign-high-volume` queues (each with DLQ), then creates two EventBridge rules on `campaign-bus` — `route-survey-campaigns` (matches `detail.campaignType = "survey"`) and `route-high-volume-campaigns` (matches `detail.audienceSize > 10000`) — and links each rule to its target queue via `PutTargets`; large comment block explaining EB vs SNS filter differences, 256 KB limit, 10K/s quota, and rule independence
+- `src/publisher/eventBridgePublisher.ts`: `putCampaignEvent()` — single-entry `PutEvents` call with `FailedEntryCount` guard; includes comprehensive comment covering EB pattern operators, partial failure semantics, and when to choose EB over SNS
+- `src/consumers/surveyConsumer.ts`: `SurveyConsumer extends BaseConsumer<CampaignPublished>` — processes survey campaigns routed by EventBridge; in-memory idempotency; 30 s visibility timeout
+- `src/consumers/highVolumeConsumer.ts`: `HighVolumeConsumer extends BaseConsumer<CampaignPublished>` — processes large-audience campaigns; 60 s visibility timeout to accommodate slower delivery pipeline
+- `src/scripts/consume-survey.ts`, `consume-high-volume.ts`: consumer entry points with SIGINT handler
+- `src/scripts/put-event.ts`: test script publishing two events to `campaign-bus` — one survey (audienceSize 500) and one email with audienceSize 50 000 — demonstrating single-rule and potential dual-rule matching
+- `npm run consume:survey`, `consume:high-volume`, `eb:put` scripts
+
+### Changed
+- `src/consumers/BaseConsumer.ts`: `parseMessages` now handles three envelope types — SNS (`Type: "Notification"` → re-parse `Message` string), EventBridge (`source` + `detail-type` + `detail` → `detail` is already a parsed object, no re-parse), and direct body (no envelope)
+- `src/events/schemas.ts`: added `"survey"` to `CampaignTypeSchema` — required so `SurveyConsumer` can validate EventBridge-routed events with `campaignType: "survey"`
+
+---
+
+## [Unreleased] — 2026-06-08
+
+### Added
 - `campaign-events.fifo` SNS FIFO topic + `campaign-processor.fifo` / `campaign-processor-dlq.fifo` FIFO queue pair, provisioned in new `createFifoResources()` in `setup.ts`; FIFO topic subscribed to FIFO queue, separate from the standard fan-out stack so existing consumers are unaffected
 - `IdempotencyKeys` DynamoDB table (HASH key `pk`; `ttl` attribute for future TTL enablement) provisioned alongside the `Campaigns` table in `createDynamoTables()`
 - `DynamoDBIdempotencyStore` in `src/lib/idempotency.ts`: durable, multi-replica idempotency backed by `PutItem` with `ConditionExpression: "attribute_not_exists(pk)"` — `ConditionalCheckFailedException` from a concurrent write race propagates as a `BatchItemFailure` so SQS re-delivers and `has()` short-circuits on the retry

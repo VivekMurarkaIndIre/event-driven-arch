@@ -3,7 +3,7 @@ import { z } from "zod";
 export const TenantTierSchema = z.enum(["free", "pro", "enterprise"]);
 export type TenantTier = z.infer<typeof TenantTierSchema>;
 
-export const CampaignTypeSchema = z.enum(["email", "sms", "push"]);
+export const CampaignTypeSchema = z.enum(["email", "sms", "push", "survey"]);
 export type CampaignType = z.infer<typeof CampaignTypeSchema>;
 
 export const CampaignPublishedSchema = z.object({

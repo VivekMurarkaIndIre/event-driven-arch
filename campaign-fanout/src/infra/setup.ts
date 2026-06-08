@@ -9,6 +9,8 @@ import {
 import {
   EventBridgeClient,
   CreateEventBusCommand,
+  PutRuleCommand,
+  PutTargetsCommand,
 } from "@aws-sdk/client-eventbridge";
 import {
   DynamoDBClient,
@@ -433,6 +435,179 @@ async function createFifoResources(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// EventBridge rules + target queues
+//
+// HOW EVENTBRIDGE CONTENT-BASED FILTERING DIFFERS FROM SNS FILTER POLICIES
+//
+// SNS filter policies
+//   Scope:   MessageAttributes only — the flat key-value map set at publish time.
+//            The message body is completely opaque to SNS; you cannot filter on
+//            any body field without duplicating it into an attribute.
+//   Syntax:  string match (exact, prefix, suffix), anything-but, numeric range.
+//            No nested paths, no cross-field conditions.
+//   Cost:    Free. Filtered messages never enter the queue and are never billed.
+//   Latency: Zero — evaluation is synchronous with delivery.
+//   Limit:   200 attribute-filter policies per topic subscription.
+//
+// EventBridge event patterns
+//   Scope:   The full event structure: source, detail-type, account, region,
+//            time, AND every field nested inside detail.* — arbitrary depth.
+//            A single pattern can combine body content with metadata conditions.
+//   Syntax:  All SNS operators plus: anything-but arrays, exists/not-exists
+//            on optional fields, IP CIDR ranges, numeric ranges, prefix on
+//            strings. Multiple fields in a pattern are implicitly ANDed.
+//   Cost:    You pay per event that enters the bus ($1 / million), regardless
+//            of whether any rule matches. A non-matching event still costs the
+//            same as a matching one.
+//   Latency: Typically sub-second, but not zero. Events flow through the bus
+//            and are evaluated asynchronously.
+//
+// PutEvents throughput and size constraints
+//   Batch size:       Up to 10 entries per PutEvents API call.
+//   Entry size limit: 256 KB per individual event entry. This is the entire
+//                     EventBridge event object (version, id, source, detail-type,
+//                     resources, and detail combined) — not just the detail payload.
+//                     SNS and SQS share the same 256 KB message limit, but only
+//                     on the body. EventBridge's limit covers all envelope fields.
+//   Throughput quota: 10,000 events per second per region by default.
+//                     Can be raised via a Service Quotas request. If you exceed
+//                     this limit, PutEvents returns throttling errors — implement
+//                     exponential backoff with jitter.
+//   Partial failure:  PutEvents is NOT all-or-nothing. Each entry has its own
+//                     success/failure. Always check FailedEntryCount and
+//                     FailedEntries in the response and retry failed entries.
+//
+// Rule independence
+//   A single event can match multiple rules simultaneously. Each matching rule
+//   delivers the event to all of its configured targets independently. A survey
+//   campaign with audienceSize > 10 000 matches BOTH the survey rule and the
+//   high-volume rule — it is enqueued in both target queues. This fan-out is
+//   intentional: each rule represents a distinct downstream concern.
+//
+// Target queues and access policy
+//   In real AWS, each SQS target queue needs a resource policy granting
+//   events.amazonaws.com permission to call sqs:SendMessage, scoped to the
+//   rule ARN via aws:SourceArn. LocalStack does not enforce this policy.
+// ---------------------------------------------------------------------------
+
+async function createEventBridgeRulesAndQueues(): Promise<void> {
+  console.log("\nCreating EventBridge rules + target queues...");
+
+  // -- Survey queue ----------------------------------------------------------
+  const surveyDlqUrl = await ensureQueue("campaign-survey-dlq", {
+    MessageRetentionPeriod: "1209600",
+  });
+  const { Attributes: surveyDlqAttrs } = await sqs.send(
+    new GetQueueAttributesCommand({ QueueUrl: surveyDlqUrl, AttributeNames: ["QueueArn"] }),
+  );
+  const surveyDlqArn = surveyDlqAttrs?.["QueueArn"];
+  if (!surveyDlqArn) throw new Error("Could not retrieve ARN for campaign-survey-dlq");
+
+  const surveyQueueUrl = await ensureQueue("campaign-survey", {
+    VisibilityTimeout: "30",
+    MessageRetentionPeriod: "345600",
+    RedrivePolicy: JSON.stringify({ deadLetterTargetArn: surveyDlqArn, maxReceiveCount: "3" }),
+  });
+  const { Attributes: surveyAttrs } = await sqs.send(
+    new GetQueueAttributesCommand({ QueueUrl: surveyQueueUrl, AttributeNames: ["QueueArn"] }),
+  );
+  const surveyQueueArn = surveyAttrs?.["QueueArn"];
+  if (!surveyQueueArn) throw new Error("Could not retrieve ARN for campaign-survey");
+  console.log(`  ✓ campaign-survey  →  DLQ: campaign-survey-dlq`);
+
+  // -- High-volume queue -----------------------------------------------------
+  const highVolDlqUrl = await ensureQueue("campaign-high-volume-dlq", {
+    MessageRetentionPeriod: "1209600",
+  });
+  const { Attributes: highVolDlqAttrs } = await sqs.send(
+    new GetQueueAttributesCommand({ QueueUrl: highVolDlqUrl, AttributeNames: ["QueueArn"] }),
+  );
+  const highVolDlqArn = highVolDlqAttrs?.["QueueArn"];
+  if (!highVolDlqArn) throw new Error("Could not retrieve ARN for campaign-high-volume-dlq");
+
+  const highVolQueueUrl = await ensureQueue("campaign-high-volume", {
+    VisibilityTimeout: "30",
+    MessageRetentionPeriod: "345600",
+    RedrivePolicy: JSON.stringify({ deadLetterTargetArn: highVolDlqArn, maxReceiveCount: "3" }),
+  });
+  const { Attributes: highVolAttrs } = await sqs.send(
+    new GetQueueAttributesCommand({ QueueUrl: highVolQueueUrl, AttributeNames: ["QueueArn"] }),
+  );
+  const highVolQueueArn = highVolAttrs?.["QueueArn"];
+  if (!highVolQueueArn) throw new Error("Could not retrieve ARN for campaign-high-volume");
+  console.log(`  ✓ campaign-high-volume  →  DLQ: campaign-high-volume-dlq`);
+
+  // -- EventBridge rules -----------------------------------------------------
+  // PutRule is idempotent: calling it with an existing rule name updates the
+  // rule in place. No "already exists" error is thrown.
+
+  // Rule 1: route survey campaigns.
+  // Pattern matches when detail.campaignType exactly equals "survey".
+  // The array syntax ["survey"] means "any of these values" — a single-element
+  // array is equivalent to an exact-match condition.
+  await eb.send(
+    new PutRuleCommand({
+      Name: "route-survey-campaigns",
+      EventBusName: "campaign-bus",
+      State: "ENABLED",
+      EventPattern: JSON.stringify({
+        source: ["campaign.service"],
+        "detail-type": ["CampaignPublished"],
+        detail: { campaignType: ["survey"] },
+      }),
+    }),
+  );
+
+  // PutTargets is also idempotent: targets are upserted by Id.
+  // FailedEntryCount > 0 means a partial failure — always check.
+  const surveyTargetResult = await eb.send(
+    new PutTargetsCommand({
+      Rule: "route-survey-campaigns",
+      EventBusName: "campaign-bus",
+      Targets: [{ Id: "campaign-survey-queue", Arn: surveyQueueArn }],
+    }),
+  );
+  if ((surveyTargetResult.FailedEntryCount ?? 0) > 0) {
+    throw new Error(
+      `PutTargets failed for route-survey-campaigns: ${JSON.stringify(surveyTargetResult.FailedEntries)}`,
+    );
+  }
+  console.log(`  ✓ rule: route-survey-campaigns  →  campaign-survey [detail.campaignType = "survey"]`);
+
+  // Rule 2: route high-volume campaigns.
+  // Numeric pattern: detail.audienceSize must be strictly greater than 10 000.
+  // EventBridge numeric operators: "=", "!=", "<", "<=", ">", ">=".
+  // The pattern [{ "numeric": [">", 10000] }] is the EventBridge rule syntax
+  // for a numeric comparison — the outer array is the "any of" wrapper.
+  await eb.send(
+    new PutRuleCommand({
+      Name: "route-high-volume-campaigns",
+      EventBusName: "campaign-bus",
+      State: "ENABLED",
+      EventPattern: JSON.stringify({
+        source: ["campaign.service"],
+        "detail-type": ["CampaignPublished"],
+        detail: { audienceSize: [{ numeric: [">", 10000] }] },
+      }),
+    }),
+  );
+
+  const highVolTargetResult = await eb.send(
+    new PutTargetsCommand({
+      Rule: "route-high-volume-campaigns",
+      EventBusName: "campaign-bus",
+      Targets: [{ Id: "campaign-high-volume-queue", Arn: highVolQueueArn }],
+    }),
+  );
+  if ((highVolTargetResult.FailedEntryCount ?? 0) > 0) {
+    throw new Error(
+      `PutTargets failed for route-high-volume-campaigns: ${JSON.stringify(highVolTargetResult.FailedEntries)}`,
+    );
+  }
+  console.log(`  ✓ rule: route-high-volume-campaigns  →  campaign-high-volume [detail.audienceSize > 10 000]`);
+}
+
+// ---------------------------------------------------------------------------
 // DynamoDB — campaign state store
 //
 // DynamoDB is not part of the messaging fan-out itself; it stores the canonical
@@ -522,6 +697,7 @@ async function main(): Promise<void> {
   await createDynamoTables();
   await createSnsSubscriptions(topicArns, queueArns);
   await createFifoResources();
+  await createEventBridgeRulesAndQueues();
 
   console.log("\nInfrastructure setup complete.");
 }

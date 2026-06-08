@@ -47,6 +47,9 @@ npm run publish:batch         # publish 10 mixed-tier events (4 free + 3 pro + 3
 npm run consume               # AnalyticsConsumer — campaign-analytics queue (all tiers)
 npm run consume:email         # EmailConsumer     — campaign-processor.fifo queue (FIFO, DynamoDB idempotency)
 npm run consume:notification  # NotificationConsumer — campaign-notifier queue (paid tiers only)
+npm run consume:survey        # SurveyConsumer    — campaign-survey queue (EventBridge: campaignType = "survey")
+npm run consume:high-volume   # HighVolumeConsumer — campaign-high-volume queue (EventBridge: audienceSize > 10000)
+npm run eb:put                # put two test events to campaign-bus (one survey, one high-volume)
 npm run dlq:monitor           # DlqMonitor — watch all 4 DLQs, emit structured JSON alerts
 npm run dlq:replay -- <dlq>   # replayDlq — drain a named DLQ back into the main queue
 

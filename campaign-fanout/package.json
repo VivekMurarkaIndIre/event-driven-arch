@@ -13,6 +13,9 @@
     "consume": "tsx src/scripts/consume.ts",
     "consume:email": "tsx src/scripts/consume-email.ts",
     "consume:notification": "tsx src/scripts/consume-notification.ts",
+    "consume:survey": "tsx src/scripts/consume-survey.ts",
+    "consume:high-volume": "tsx src/scripts/consume-high-volume.ts",
+    "eb:put": "tsx src/scripts/put-event.ts",
     "dlq:monitor": "tsx src/consumers/dlqMonitor.ts",
     "dlq:replay": "tsx src/scripts/replayDlq.ts",
     "test": "vitest"

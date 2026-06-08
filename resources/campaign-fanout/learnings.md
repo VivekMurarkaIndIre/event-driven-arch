@@ -126,6 +126,19 @@
 - **DLQ replay should target the main SQS queue directly, not SNS.** Re-publishing through SNS fans the message out to every subscribed queue, turning a single-queue replay into a broadcast. Publishing directly to the main SQS queue (`SendMessageCommand`) re-queues the message exactly where it failed, with all original attributes preserved plus a new `replayedAt` marker.
 
 ### 2026-06-08
+### 2026-06-08
+- **EventBridge `detail` is already a parsed object — do not `JSON.parse` it again.** When EventBridge delivers to an SQS target the SQS message body is the full EventBridge event JSON, with the business payload in `detail` as a parsed object. SNS puts the payload inside `Message` as a JSON *string* that must be re-parsed. The `BaseConsumer.parseMessages` handles this: `isEventBridgeEnvelope` detects the EB envelope and casts `outer.detail as TBody` directly; `isSnsEnvelope` detects the SNS envelope and calls `JSON.parse(outer.Message)`. Double-parsing the EB payload corrupts objects like dates into `"[object Object]"`.
+
+- **EventBridge `PutRule` / `PutTargets` are idempotent upserts — no "already exists" error.** Unlike EventBridge `CreateEventBus` (which throws `ResourceAlreadyExistsException`), `PutRule` silently overwrites an existing rule with the same name. This makes rules safe to provision on every `infra:setup` run without an existence guard.
+
+- **`PutEvents` does not throw on entry-level failure — check `FailedEntryCount`.** A `PutEvents` call can return HTTP 200 with `FailedEntryCount: 1`. The failure reason is in `Entries[i].ErrorCode` and `ErrorMessage`. If you only check for an exception you will silently lose events.
+
+- **EventBridge numeric range pattern syntax: `[{ "numeric": [">", 10000] }]`.** The outer array is the "any of these conditions" wrapper. The inner array `[">", 10000]` is the operator-value pair. This is different from SNS numeric ranges, which use `[{ "numeric": [">=", 0, "<=", 100] }]` for closed ranges. EventBridge supports `=`, `!=`, `<`, `<=`, `>`, `>=`; SNS supports the same operators but only as a closed range syntax.
+
+- **One EventBridge event can match multiple rules simultaneously.** A survey campaign with `audienceSize: 15000` matches both `route-survey-campaigns` (campaignType = "survey") and `route-high-volume-campaigns` (audienceSize > 10000). EventBridge delivers it to both target queues independently — neither rule "wins". Design consumers to handle this: `SurveyConsumer` and `HighVolumeConsumer` may receive the same event and must each process it for their own concern.
+
+- **Adding a new enum value to a Zod schema (`"survey"`) is a breaking change for existing serialised data if strict parsing is used.** Any DLQ message serialised before the schema change that has `campaignType: "survey"` would have been invalid under the old schema and already in the DLQ. Conversely, adding the value makes the schema looser — old consumers that do `CampaignPublishedSchema.safeParse` will now accept events they previously rejected. Schema additions are backwards-compatible in the accept direction; removals are breaking.
+
 - **SNS standard and FIFO topics cannot share subscriptions.** A FIFO SQS queue can only subscribe to a FIFO SNS topic; a standard SQS queue cannot subscribe to a FIFO topic. This is an AWS hard constraint, not a soft recommendation. Running both stacks in parallel is the only way to give some consumers FIFO semantics without migrating all consumers.
 
 - **FIFO SQS queue DLQ must also be FIFO.** `CreateQueue` for a FIFO queue with a `RedrivePolicy` pointing to a standard DLQ throws `InvalidParameterValue`. Create the DLQ with `FifoQueue: "true"` first.

@@ -56,6 +56,27 @@ function isSnsEnvelope(value: unknown): value is SnsEnvelope {
   return obj["Type"] === "Notification" && typeof obj["Message"] === "string";
 }
 
+// EventBridge wraps the payload in a full event envelope when it delivers to
+// an SQS target. The business payload lives in the `detail` field as a parsed
+// object — unlike SNS, where `Message` is a JSON string that must be re-parsed.
+interface EventBridgeEnvelope {
+  version: string;
+  id: string;
+  source: string;
+  "detail-type": string;
+  detail: unknown;
+}
+
+function isEventBridgeEnvelope(value: unknown): value is EventBridgeEnvelope {
+  if (typeof value !== "object" || value === null) return false;
+  const obj = value as Record<string, unknown>;
+  return (
+    typeof obj["source"] === "string" &&
+    typeof obj["detail-type"] === "string" &&
+    "detail" in obj
+  );
+}
+
 export abstract class BaseConsumer<TBody> {
   private running = false;
 
@@ -161,9 +182,20 @@ export abstract class BaseConsumer<TBody> {
 
       try {
         const outer: unknown = JSON.parse(raw.Body);
-        // Unwrap the SNS envelope if present; otherwise parse the body directly.
-        const payloadStr = isSnsEnvelope(outer) ? outer.Message : raw.Body;
-        const body = JSON.parse(payloadStr) as TBody;
+        // Unwrap delivery envelopes so subclasses always receive the plain payload.
+        // SNS envelope:         { Type: "Notification", Message: "<json-string>" }
+        //   → re-parse Message string to get the payload object.
+        // EventBridge envelope: { source: "...", "detail-type": "...", detail: {...} }
+        //   → detail is already a parsed object, no second JSON.parse needed.
+        // Direct body (no envelope): the parsed outer IS the payload.
+        let body: TBody;
+        if (isSnsEnvelope(outer)) {
+          body = JSON.parse(outer.Message) as TBody;
+        } else if (isEventBridgeEnvelope(outer)) {
+          body = outer.detail as TBody;
+        } else {
+          body = outer as TBody;
+        }
 
         parsed.push({
           messageId: raw.MessageId,
