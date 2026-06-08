@@ -45,7 +45,7 @@ npm run publish:batch         # publish 10 mixed-tier events (4 free + 3 pro + 3
 
 # Consuming (run each in its own terminal)
 npm run consume               # AnalyticsConsumer — campaign-analytics queue (all tiers)
-npm run consume:email         # EmailConsumer     — campaign-processor queue (all tiers)
+npm run consume:email         # EmailConsumer     — campaign-processor.fifo queue (FIFO, DynamoDB idempotency)
 npm run consume:notification  # NotificationConsumer — campaign-notifier queue (paid tiers only)
 npm run dlq:monitor           # DlqMonitor — watch all 4 DLQs, emit structured JSON alerts
 npm run dlq:replay -- <dlq>   # replayDlq — drain a named DLQ back into the main queue

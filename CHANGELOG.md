@@ -8,6 +8,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased] — 2026-06-08
 
 ### Added
+- `campaign-events.fifo` SNS FIFO topic + `campaign-processor.fifo` / `campaign-processor-dlq.fifo` FIFO queue pair, provisioned in new `createFifoResources()` in `setup.ts`; FIFO topic subscribed to FIFO queue, separate from the standard fan-out stack so existing consumers are unaffected
+- `IdempotencyKeys` DynamoDB table (HASH key `pk`; `ttl` attribute for future TTL enablement) provisioned alongside the `Campaigns` table in `createDynamoTables()`
+- `DynamoDBIdempotencyStore` in `src/lib/idempotency.ts`: durable, multi-replica idempotency backed by `PutItem` with `ConditionExpression: "attribute_not_exists(pk)"` — `ConditionalCheckFailedException` from a concurrent write race propagates as a `BatchItemFailure` so SQS re-delivers and `has()` short-circuits on the retry
+- `topicType?: "standard" | "fifo"` option in `PublishOptions`; when `"fifo"`, `publishCampaignEvent` includes `MessageGroupId: campaignId` and `MessageDeduplicationId: SHA-256(campaignId:version)` in the `PublishCommand`; neither field is sent for standard topics (SNS rejects them with `InvalidParameter`)
+- Large delivery-guarantees comment in `src/publisher/campaignPublisher.ts` and `src/lib/idempotency.ts` covering at-least-once, at-most-once, exactly-once, and why FIFO deduplication prevents duplicate enqueuing but not duplicate processing
+
+### Changed
+- `IdempotencyStore` interface methods (`has`, `add`) are now `Promise<boolean>` / `Promise<void>`; `InMemoryIdempotencyStore` wraps in `Promise.resolve()` — no behaviour change, but all consumers now `await` the calls
+- `EmailConsumer` factory (`createEmailConsumer`) switched from `InMemoryIdempotencyStore` to `DynamoDBIdempotencyStore`; points to the FIFO queue (`campaign-processor.fifo`)
+- `consume-email.ts` updated to use the FIFO queue URL
+- `ensureQueue` in `setup.ts` now filters `FifoQueue` and `ContentBasedDeduplication` from the `SetQueueAttributes` fallback call — these attributes are immutable after queue creation and cannot be updated
+
+---
+
+## [Unreleased] — 2026-06-08
+
+### Added
 - `src/consumers/dlqMonitor.ts`: `DlqMonitor` class — polls all 4 DLQs every 10 s, peeks with `VisibilityTimeout: 5`, emits one structured JSON alert per message to stdout, then releases messages back with `ChangeMessageVisibilityBatch(0)` so they immediately return to the DLQ
 - `src/scripts/replayDlq.ts`: drain-and-replay script — takes a DLQ name, derives the main queue name by stripping `-dlq`, re-queues each message to the main SQS queue with a `replayedAt` message attribute, and deletes from the DLQ only after successful `SendMessage`; skips messages that already carry `replayedAt` to prevent infinite replay loops
 - `npm run dlq:monitor` and `npm run dlq:replay -- <dlq-name>` scripts

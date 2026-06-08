@@ -4,37 +4,64 @@ import type { CampaignPublished } from "../events/schemas.js";
 
 export interface PublishResult {
   messageId: string;
-  // Returned so callers can log or store the dedup key alongside the messageId.
   messageDeduplicationId: string;
 }
 
 export interface PublishOptions {
-  // Event schema version. Incrementing version changes the deduplication key,
-  // which is intentional: a schema-breaking change produces a new logical event.
+  // Event schema version. Changing this produces a new deduplication key,
+  // which is intentional: a schema-breaking change is a new logical event.
   version: number;
+  // "standard" (default): no ordering or deduplication at the broker layer.
+  //   MessageGroupId and MessageDeduplicationId are not sent — SNS rejects
+  //   them on standard topics with InvalidParameter.
+  // "fifo": requires a FIFO topic ARN. Enables per-campaign ordered delivery
+  //   and 5-minute deduplication window at the enqueue boundary.
+  topicType?: "standard" | "fifo";
 }
 
-// Compute a stable identifier for this (event, version) pair.
-//
-// Standard topic behaviour — what happens when the same event is published twice:
-//   SNS delivers both messages independently. The MessageDeduplicationId is NOT
-//   sent to standard topics (SNS rejects it with InvalidParameter). Deduplication
-//   must happen at the consumer: store the campaignId+version key in DynamoDB or
-//   Redis on first successful processing and idempotency-check on every receive.
-//
-// FIFO topic behaviour — what happens when the same event is published twice:
-//   SNS uses MessageDeduplicationId to suppress the second publish within a
-//   5-minute deduplication window. The second PublishCommand call returns the
-//   same MessageId as the first and delivers nothing to subscribers. After the
-//   window expires, a third publish with the same key is treated as a new message.
-//   FIFO topics also guarantee exactly-once delivery *to the queue* (combined with
-//   SQS FIFO), but the consumer can still receive the same message more than once
-//   if it crashes after receive but before deletion — so idempotency is still required.
+// Compute a deterministic identifier for this (campaignId, schema version) pair.
 function computeDeduplicationId(campaignId: string, version: number): string {
-  return createHash("sha256")
-    .update(`${campaignId}:${version}`)
-    .digest("hex");
+  return createHash("sha256").update(`${campaignId}:${version}`).digest("hex");
 }
+
+// ---------------------------------------------------------------------------
+// Delivery guarantees — what each topic type provides and what it does not
+// ---------------------------------------------------------------------------
+//
+// STANDARD TOPIC (default, used for analytics / notifier / audit queues)
+//   Delivery: at-least-once. SQS may deliver the same message more than once.
+//   Ordering: best-effort. Messages from the same publisher may arrive out of
+//     order at the consumer.
+//   Deduplication: none at the broker. The MessageDeduplicationId computed
+//     below is NOT sent to standard topics (SNS rejects it); it is logged
+//     for use as a consumer-side idempotency key.
+//
+// FIFO TOPIC (topicType: "fifo", used for the email consumer)
+//   Delivery: at-least-once TO THE CONSUMER — see note below.
+//   Ordering: strict, per MessageGroupId. All messages with the same
+//     campaignId are delivered to the consumer in the order they were
+//     published. Different campaign groups are independent.
+//   Deduplication (enqueue): within a 5-minute window, a second PublishCommand
+//     with the same MessageDeduplicationId is silently discarded — the message
+//     is never written to the SQS queue a second time. After the window, a
+//     re-publish with the same ID is treated as a new message.
+//
+//   WHY FIFO DEDUPLICATION ≠ EXACTLY-ONCE PROCESSING
+//   SNS FIFO deduplication operates only at the publish → enqueue boundary.
+//   Once a message is in the SQS FIFO queue, SQS delivers it at-least-once:
+//   if a consumer receives the message, processes it (sends the email), but
+//   crashes before calling DeleteMessage, SQS re-delivers the message after
+//   the visibility timeout expires. At that point the message was never
+//   duplicated at the enqueue layer; SQS simply cannot know the consumer
+//   already succeeded. Consumer-side idempotency (DynamoDB conditional write)
+//   is required in addition to — not instead of — FIFO deduplication.
+//
+//   The combination of FIFO enqueue deduplication + DynamoDB consumer
+//   idempotency is the closest AWS approximation of exactly-once delivery.
+//   True exactly-once would require a distributed transaction spanning the
+//   consumer's business operation and the idempotency store — not available
+//   without 2-phase commit.
+// ---------------------------------------------------------------------------
 
 export async function publishCampaignEvent(
   client: SNSClient,
@@ -42,15 +69,12 @@ export async function publishCampaignEvent(
   event: CampaignPublished,
   opts: PublishOptions,
 ): Promise<PublishResult> {
-  const messageDeduplicationId = computeDeduplicationId(
-    event.campaignId,
-    opts.version,
-  );
+  const messageDeduplicationId = computeDeduplicationId(event.campaignId, opts.version);
+  const topicType = opts.topicType ?? "standard";
 
-  // Message attributes are indexed by SNS and can be used in SQS subscription
-  // filter policies so consumers receive only the subset of events they need —
-  // without deserialising the message body. For example, a "pro-tier notifier"
-  // queue can filter on tenantTier = "pro" | "enterprise" at the SNS layer.
+  // Message attributes are evaluated by SNS subscription filter policies before
+  // delivery. Any field used for broker-side filtering must be present here even
+  // if it duplicates a body field — the body is opaque to the broker.
   const { MessageId } = await client.send(
     new PublishCommand({
       TopicArn: topicArn,
@@ -60,6 +84,16 @@ export async function publishCampaignEvent(
         tenantTier: { DataType: "String", StringValue: event.tenantTier },
         eventType: { DataType: "String", StringValue: "CampaignPublished" },
       },
+      // FIFO-only fields. Standard topics reject these with InvalidParameter.
+      ...(topicType === "fifo" && {
+        // All messages for the same campaign are ordered within their group.
+        // Consumers process one group at a time; a slow campaign does not
+        // block messages for other campaigns.
+        MessageGroupId: event.campaignId,
+        // Prevents the same (campaignId, version) from being enqueued twice
+        // within the 5-minute SNS deduplication window.
+        MessageDeduplicationId: messageDeduplicationId,
+      }),
     }),
   );
 

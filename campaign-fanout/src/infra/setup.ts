@@ -109,6 +109,14 @@ async function createSnsTopics(): Promise<Map<string, string>> {
 // This helper handles that case: on QueueNameExists, resolve the existing URL
 // and apply the desired attributes via SetQueueAttributes so infra:setup is safe
 // to re-run after any configuration change.
+//
+// FifoQueue and ContentBasedDeduplication are set at creation time and cannot
+// be modified via SetQueueAttributes — they are filtered out of the update call.
+const IMMUTABLE_QUEUE_ATTRS: ReadonlySet<string> = new Set([
+  "FifoQueue",
+  "ContentBasedDeduplication",
+]);
+
 async function ensureQueue(
   queueName: string,
   attributes: Record<string, string>,
@@ -121,10 +129,15 @@ async function ensureQueue(
     return QueueUrl;
   } catch (err) {
     if ((err as { name?: string }).name !== "QueueNameExists") throw err;
-    // Queue exists with different attributes — resolve URL and update in place.
+    // Queue exists with different attributes — resolve URL and update mutable ones.
     const { QueueUrl } = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
     if (!QueueUrl) throw new Error(`Could not resolve URL for: ${queueName}`);
-    await sqs.send(new SetQueueAttributesCommand({ QueueUrl, Attributes: attributes }));
+    const mutableAttrs = Object.fromEntries(
+      Object.entries(attributes).filter(([k]) => !IMMUTABLE_QUEUE_ATTRS.has(k)),
+    );
+    if (Object.keys(mutableAttrs).length > 0) {
+      await sqs.send(new SetQueueAttributesCommand({ QueueUrl, Attributes: mutableAttrs }));
+    }
     return QueueUrl;
   }
 }
@@ -332,6 +345,94 @@ async function createSnsSubscriptions(
 }
 
 // ---------------------------------------------------------------------------
+// FIFO resources — ordered, deduplicated delivery for the email consumer
+//
+// Standard SNS → SQS fan-out is unordered and at-least-once. For the email
+// consumer, sending the same campaign email twice to a recipient is a worse
+// outcome than a brief delay. The FIFO stack addresses this:
+//
+//   campaign-events.fifo (SNS FIFO topic)
+//     ↓ MessageGroupId = campaignId  (one ordered stream per campaign)
+//     ↓ MessageDeduplicationId = SHA-256(campaignId:version)
+//   campaign-processor.fifo (SQS FIFO queue)
+//     → EmailConsumer (DynamoDB-backed idempotency store)
+//
+// Why a separate FIFO topic rather than migrating the standard one?
+//   Standard and FIFO topics cannot share subscriptions — a FIFO queue can
+//   only subscribe to a FIFO topic and vice versa. Running both in parallel
+//   lets the existing standard consumers (analytics, audit, notifier) continue
+//   unchanged while the email consumer moves to the stronger delivery model.
+// ---------------------------------------------------------------------------
+
+async function createFifoResources(): Promise<void> {
+  console.log("\nCreating FIFO resources...");
+
+  // 1. FIFO SNS topic.
+  //    ContentBasedDeduplication: "false" — we provide explicit MessageDeduplicationId
+  //    values (SHA-256 of campaignId:version), which is more reliable than a hash
+  //    of the message body (body hash collides if two campaigns happen to produce
+  //    identical JSON, however unlikely).
+  const { TopicArn: fifoTopicArn } = await sns.send(
+    new CreateTopicCommand({
+      Name: "campaign-events.fifo",
+      Attributes: {
+        FifoTopic: "true",
+        ContentBasedDeduplication: "false",
+      },
+    }),
+  );
+  if (!fifoTopicArn) throw new Error("No TopicArn returned for campaign-events.fifo");
+  console.log(`  ✓ campaign-events.fifo  →  ${fifoTopicArn}`);
+
+  // 2. FIFO DLQ — must also be a FIFO queue; a FIFO main queue's DLQ must match.
+  const fifoDlqUrl = await ensureQueue("campaign-processor-dlq.fifo", {
+    FifoQueue: "true",
+    ContentBasedDeduplication: "false",
+    MessageRetentionPeriod: "1209600", // 14 days
+  });
+
+  const { Attributes: fifoDlqAttrs } = await sqs.send(
+    new GetQueueAttributesCommand({ QueueUrl: fifoDlqUrl, AttributeNames: ["QueueArn"] }),
+  );
+  const fifoDlqArn = fifoDlqAttrs?.["QueueArn"];
+  if (!fifoDlqArn) throw new Error("Could not retrieve ARN for campaign-processor-dlq.fifo");
+
+  // 3. FIFO main queue.
+  //    ContentBasedDeduplication: "false" — the SNS-level dedup ID flows through
+  //    to SQS when delivered via a FIFO SNS subscription, so we don't need a
+  //    second hash at the queue level.
+  const fifoMainUrl = await ensureQueue("campaign-processor.fifo", {
+    FifoQueue: "true",
+    ContentBasedDeduplication: "false",
+    VisibilityTimeout: "30",
+    MessageRetentionPeriod: "345600", // 4 days
+    RedrivePolicy: JSON.stringify({ deadLetterTargetArn: fifoDlqArn, maxReceiveCount: "3" }),
+  });
+  console.log(`  ✓ campaign-processor.fifo  →  DLQ: campaign-processor-dlq.fifo`);
+
+  const { Attributes: fifoMainAttrs } = await sqs.send(
+    new GetQueueAttributesCommand({ QueueUrl: fifoMainUrl, AttributeNames: ["QueueArn"] }),
+  );
+  const fifoMainArn = fifoMainAttrs?.["QueueArn"];
+  if (!fifoMainArn) throw new Error("Could not retrieve ARN for campaign-processor.fifo");
+
+  // 4. Subscribe the FIFO queue to the FIFO topic.
+  //    No filter policy — the FIFO topic is purpose-built for the email consumer
+  //    and only receives events explicitly published to it.
+  //    Note: in real AWS, the FIFO queue also needs a resource policy allowing
+  //    sns.amazonaws.com to call sqs:SendMessage. LocalStack does not enforce this.
+  await sns.send(
+    new SubscribeCommand({
+      TopicArn: fifoTopicArn,
+      Protocol: "sqs",
+      Endpoint: fifoMainArn,
+      Attributes: {},
+    }),
+  );
+  console.log(`  ✓ campaign-events.fifo → campaign-processor.fifo  [ordered, deduplicated]`);
+}
+
+// ---------------------------------------------------------------------------
 // DynamoDB — campaign state store
 //
 // DynamoDB is not part of the messaging fan-out itself; it stores the canonical
@@ -376,9 +477,32 @@ async function createDynamoTables(): Promise<void> {
     );
     console.log("  ✓ Campaigns");
   } catch (err) {
-    // Idempotent: table already exists from a previous run.
     if ((err as { name?: string }).name === "ResourceInUseException") {
       console.log("  ✓ Campaigns  (already exists)");
+    } else {
+      throw err;
+    }
+  }
+
+  // IdempotencyKeys: shared deduplication store for all consumer replicas.
+  //   pk (S, HASH) — the composite idempotency key (messageId:eventId)
+  //   createdAt (S) — ISO timestamp for debugging
+  //   ttl (N)       — Unix epoch; enable TTL on this attribute via UpdateTimeToLive
+  //                   to auto-expire keys older than the SQS retention period.
+  // No GSI needed: consumers only do exact key lookups (GetItem + PutItem).
+  try {
+    await dynamo.send(
+      new CreateTableCommand({
+        TableName: "IdempotencyKeys",
+        BillingMode: BillingMode.PAY_PER_REQUEST,
+        KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+        AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+      }),
+    );
+    console.log("  ✓ IdempotencyKeys");
+  } catch (err) {
+    if ((err as { name?: string }).name === "ResourceInUseException") {
+      console.log("  ✓ IdempotencyKeys  (already exists)");
     } else {
       throw err;
     }
@@ -397,6 +521,7 @@ async function main(): Promise<void> {
   await createEventBridgeBuses();
   await createDynamoTables();
   await createSnsSubscriptions(topicArns, queueArns);
+  await createFifoResources();
 
   console.log("\nInfrastructure setup complete.");
 }

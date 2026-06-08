@@ -45,14 +45,14 @@ export class NotificationConsumer extends BaseConsumer<CampaignPublished> {
       const event = result.data;
       const key = makeIdempotencyKey(msg.messageId, event.campaignId);
 
-      if (this.idempotency.has(key)) {
+      if (await this.idempotency.has(key)) {
         console.log(`[NotificationConsumer] duplicate — skipping ${msg.messageId} (campaignId=${event.campaignId})`);
         continue;
       }
 
       try {
         await this.sendNotification(event);
-        this.idempotency.add(key);
+        await this.idempotency.add(key);
       } catch (err) {
         console.error(`[NotificationConsumer] failed to send notification for ${msg.messageId}:`, err);
         failures.push({ itemIdentifier: msg.messageId });

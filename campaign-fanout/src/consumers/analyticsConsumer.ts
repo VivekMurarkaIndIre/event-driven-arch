@@ -7,6 +7,7 @@ import {
   type IdempotencyStore,
 } from "../lib/idempotency.js";
 
+
 export class AnalyticsConsumer extends BaseConsumer<CampaignPublished> {
   constructor(
     sqs: SQSClient,
@@ -76,7 +77,7 @@ export class AnalyticsConsumer extends BaseConsumer<CampaignPublished> {
       //   campaignId covers scenario 3 (different messageId, same business event).
       const key = makeIdempotencyKey(msg.messageId, event.campaignId);
 
-      if (this.idempotency.has(key)) {
+      if (await this.idempotency.has(key)) {
         console.log(
           `[AnalyticsConsumer] duplicate — skipping ${msg.messageId} ` +
             `(campaignId=${event.campaignId})`,
@@ -90,7 +91,7 @@ export class AnalyticsConsumer extends BaseConsumer<CampaignPublished> {
         await this.recordAnalytics(event);
         // Mark AFTER successful processing. Marking before means a crash between
         // mark and write leaves the event permanently unprocessed with no retry.
-        this.idempotency.add(key);
+        await this.idempotency.add(key);
       } catch (err) {
         console.error(
           `[AnalyticsConsumer] failed to record analytics for ${msg.messageId}:`,

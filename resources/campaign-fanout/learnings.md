@@ -125,4 +125,17 @@
 
 - **DLQ replay should target the main SQS queue directly, not SNS.** Re-publishing through SNS fans the message out to every subscribed queue, turning a single-queue replay into a broadcast. Publishing directly to the main SQS queue (`SendMessageCommand`) re-queues the message exactly where it failed, with all original attributes preserved plus a new `replayedAt` marker.
 
+### 2026-06-08
+- **SNS standard and FIFO topics cannot share subscriptions.** A FIFO SQS queue can only subscribe to a FIFO SNS topic; a standard SQS queue cannot subscribe to a FIFO topic. This is an AWS hard constraint, not a soft recommendation. Running both stacks in parallel is the only way to give some consumers FIFO semantics without migrating all consumers.
+
+- **FIFO SQS queue DLQ must also be FIFO.** `CreateQueue` for a FIFO queue with a `RedrivePolicy` pointing to a standard DLQ throws `InvalidParameterValue`. Create the DLQ with `FifoQueue: "true"` first.
+
+- **`FifoQueue` and `ContentBasedDeduplication` are immutable after queue creation.** `SetQueueAttributes` rejects them with `InvalidParameterValue`. Filter them out of the fallback update call in any "upsert" queue helper; otherwise a re-run that tries to update these attributes will always fail.
+
+- **SNS FIFO deduplication window is 5 minutes; after that window a re-publish IS delivered.** If the producer re-publishes the same `MessageDeduplicationId` 6 minutes later, SNS treats it as a new message. Consumer-side idempotency (DynamoDB conditional write) remains the durable guarantee — it never expires within the SQS message retention period.
+
+- **DynamoDB conditional write race: optimistic concurrency, not a hard lock.** Two consumers can both pass `has()` before either calls `add()`. Both may execute the business operation (send the email); only one `PutItem` with `attribute_not_exists(pk)` succeeds. The "loser" gets `ConditionalCheckFailedException`, which surfaces as a `BatchItemFailure`. On SQS re-delivery, `has()` returns true and the message is skipped cleanly. The race window is small (time between `has()` and `add()` across two processes) but real — this is why "mark after success" is the correct ordering, not "mark before work".
+
+- **`IdempotencyStore` interface should be async even if the in-memory implementation is sync.** Async interfaces let you swap `InMemoryIdempotencyStore` for `DynamoDBIdempotencyStore` (or Redis, or any remote store) without changing the consumer contract. `Promise.resolve(value)` from the in-memory store has negligible overhead and keeps the interface honest about the semantics of the production implementation.
+
 - **`replayedAt` message attribute breaks infinite DLQ replay loops.** On replay, add `replayedAt: ISO timestamp` to the SQS `MessageAttributes`. If the replayed message fails again and lands back in the DLQ, it carries this attribute. The replay script detects it and skips rather than re-queuing indefinitely. A twice-failed message needs manual investigation, not another automated replay.

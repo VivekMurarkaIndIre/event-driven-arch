@@ -116,6 +116,27 @@ for fast processors; increase per-queue as processing time grows.
 - `replayDlq` re-publishes to the main SQS queue directly, bypassing SNS. This means SNS filter policies don't re-apply on replay — which is intentional (the message already passed the filter when originally published) but means the operator must target the correct DLQ for the queue they want to re-populate.
 - A message that fails after replay carries `replayedAt` when it hits the DLQ again. The replay script skips it. Recovery then requires manual investigation or a schema fix before the next replay.
 
+### 2026-06-08 — FIFO delivery stack and DynamoDB idempotency
+
+**Decision:** Add a parallel FIFO stack (`campaign-events.fifo` → `campaign-processor.fifo`) for the email consumer alongside the existing standard fan-out, rather than migrating the standard topics to FIFO.
+
+**Why:** Standard and FIFO SNS topics cannot share subscriptions — a FIFO SQS queue can only subscribe to a FIFO SNS topic. Migrating the standard topics would require updating all four consumer subscriptions and introducing ordering constraints (FIFO throughput ceiling: 300 msg/s per group) on consumers that don't need them. Running FIFO in parallel lets the email consumer gain stronger delivery guarantees while analytics, audit, and notification consumers continue with the simpler, higher-throughput standard stack.
+
+**Trade-offs:**
+- Two parallel stacks mean the producer must decide which topic to publish to. Currently `publish.ts` targets the standard topic; to use the FIFO stack, the caller passes `topicType: "fifo"`.
+- FIFO throughput limit: 300 published messages per second globally (3 000/s with high throughput mode). For campaign events this is acceptable; for high-volume event ingestion it would be a ceiling.
+- The 5-minute SNS FIFO deduplication window means a re-publish with the same `MessageDeduplicationId` after the window IS delivered again. Consumer-side DynamoDB idempotency remains the durable safety net.
+
+**Decision:** Replace `InMemoryIdempotencyStore` with `DynamoDBIdempotencyStore` for the email consumer; keep in-memory for analytics and notifications.
+
+**Why:** Email send is the most dangerous duplicate — a user receiving the same campaign email twice is a concrete negative user experience and a CAN-SPAM / GDPR compliance risk. DynamoDB conditional write (`attribute_not_exists(pk)`) is atomic across any number of consumer replicas; the in-memory store is per-process and per-restart. Analytics and notification consumers have lower duplicate risk (a double-counted impression or an extra push notification is inconvenient but not a compliance issue) and don't justify the added DynamoDB latency.
+
+**Trade-offs:**
+- Every idempotency check for the email consumer now incurs a `GetItem` + `PutItem` round-trip to DynamoDB. For a consumer processing 10 messages per batch at 30ms average DynamoDB latency, this adds ~300ms to each batch — acceptable for an email workload, problematic for a high-throughput stream processor.
+- The race window between `has()` returning false and `add()` succeeding is real. Two concurrent consumers can both pass the `has()` check, both send the email, and then one fails the `add()` conditional write. The failure surfaces as a `BatchItemFailure` and triggers an SQS retry, at which point `has()` returns true. The email was sent twice in this scenario — acceptable during a race condition, which is rare under SQS FIFO per-group ordering.
+
+---
+
 **Decision:** Apply SNS subscription filter `{ tenantTier: ["pro", "enterprise"] }` to the `campaign-notifier` subscription; all other queue subscriptions carry no filter.
 
 **Why:** The notifier sends push/SMS notifications, a paid-tier feature. Free-tier tenants generating campaign events should never trigger notification delivery. Enforcing this at the SNS broker (before the message enters the queue) means the `NotificationConsumer` receives zero free-tier messages and incurs zero processing cost for them. The alternative — receiving all messages and skipping in the consumer — wastes ReceiveMessage API calls, increases queue depth metrics, and requires consumer logic to know about tier rules.
