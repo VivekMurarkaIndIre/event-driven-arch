@@ -8,6 +8,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased] — 2026-06-08
 
 ### Added
+- `src/consumers/emailConsumer.ts`: `EmailConsumer` reading from `campaign-processor`; no filter — receives all tenant tiers
+- `src/consumers/notificationConsumer.ts`: `NotificationConsumer` reading from `campaign-notifier`; trusts the SNS broker filter to deliver only paid-tier events
+- `src/scripts/publishBatch.ts`: publishes 10 events with mixed `tenantTier` values (4 free, 3 pro, 3 enterprise); prints per-event routing and expected queue depths
+- `src/scripts/consume-email.ts` and `src/scripts/consume-notification.ts`: runnable consumer entry points
+- `npm run publish:batch`, `npm run consume:email`, `npm run consume:notification` scripts
+- SNS → SQS subscriptions now created inside `infra:setup` (`createSnsSubscriptions`); filter policy `{ tenantTier: ["pro", "enterprise"] }` on `campaign-notifier` subscription
+- Large comment block in `setup.ts` comparing SNS filter policies (attribute-based, broker-side, no body access) vs EventBridge rules (content-based, body + metadata, more expressive)
+
+### Fixed
+- `infra:setup` is now fully idempotent: `createEventBridgeBuses` and `createDynamoTables` catch `ResourceAlreadyExistsException` / `ResourceInUseException` and continue, so re-running after a partial LocalStack restart no longer fails
+
+### Changed
+- `createSnsTopics` and `createSqsQueuesWithDlqs` now return `Map<string, string>` (name → ARN) consumed by `createSnsSubscriptions`
+
+---
+
+## [Unreleased] — 2026-06-08
+
+### Added
 - `src/consumers/BaseConsumer.ts`: abstract generic SQS consumer with long polling (`WaitTimeSeconds: 20`), configurable batch size, visibility timeout extension loop (fires at `visibilityTimeout / 2`), SNS envelope unwrapping, partial batch response (`batchItemFailures`), and graceful error containment
 - `src/lib/idempotency.ts`: `InMemoryIdempotencyStore` and `makeIdempotencyKey(messageId, eventId)` — composite key covering both SQS re-deliveries and producer-level retry duplicates
 - `src/consumers/analyticsConsumer.ts`: `AnalyticsConsumer extends BaseConsumer<CampaignPublished>` with runtime Zod re-validation, idempotency guard, and `createAnalyticsConsumer` factory

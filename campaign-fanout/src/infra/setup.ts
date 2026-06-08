@@ -1,4 +1,4 @@
-import { SNSClient, CreateTopicCommand } from "@aws-sdk/client-sns";
+import { SNSClient, CreateTopicCommand, SubscribeCommand } from "@aws-sdk/client-sns";
 import {
   SQSClient,
   CreateQueueCommand,
@@ -72,17 +72,18 @@ const EVENT_BUSES = ["campaign-bus", "campaign-dlq-bus"] as const;
 // rate may exceed the 300 msg/s FIFO ceiling in future.
 // ---------------------------------------------------------------------------
 
-async function createSnsTopics(): Promise<void> {
+async function createSnsTopics(): Promise<Map<string, string>> {
   console.log("Creating SNS topics...");
+  const arns = new Map<string, string>();
   for (const name of SNS_TOPICS) {
     const { TopicArn } = await sns.send(
-      new CreateTopicCommand({
-        Name: name,
-        Attributes: {},
-      }),
+      new CreateTopicCommand({ Name: name, Attributes: {} }),
     );
+    if (!TopicArn) throw new Error(`No TopicArn returned for: ${name}`);
+    arns.set(name, TopicArn);
     console.log(`  ✓ ${name}  →  ${TopicArn}`);
   }
+  return arns;
 }
 
 // ---------------------------------------------------------------------------
@@ -100,8 +101,10 @@ async function createSnsTopics(): Promise<void> {
 //   - Zero operational overhead vs. shard management (Kinesis) or broker ops (Kafka).
 // ---------------------------------------------------------------------------
 
-async function createSqsQueuesWithDlqs(): Promise<void> {
+async function createSqsQueuesWithDlqs(): Promise<Map<string, string>> {
   console.log("\nCreating SQS queues + DLQs...");
+  const queueArns = new Map<string, string>();
+
   for (const name of SQS_QUEUES) {
     const dlqName = `${name}-dlq`;
 
@@ -132,7 +135,7 @@ async function createSqsQueuesWithDlqs(): Promise<void> {
     //    while preventing a poison message from looping indefinitely.
     //    VisibilityTimeout=30s: safe default for fast processors; increase per-queue
     //    if processing time grows (timeout < processing time = duplicate delivery).
-    await sqs.send(
+    const { QueueUrl: mainUrl } = await sqs.send(
       new CreateQueueCommand({
         QueueName: name,
         Attributes: {
@@ -145,9 +148,23 @@ async function createSqsQueuesWithDlqs(): Promise<void> {
         },
       }),
     );
+    if (!mainUrl) throw new Error(`No QueueUrl returned for queue: ${name}`);
 
+    // 4. Resolve the main queue ARN — needed when creating SNS subscriptions.
+    const { Attributes: mainAttrs } = await sqs.send(
+      new GetQueueAttributesCommand({
+        QueueUrl: mainUrl,
+        AttributeNames: ["QueueArn"],
+      }),
+    );
+    const mainArn = mainAttrs?.["QueueArn"];
+    if (!mainArn) throw new Error(`Could not retrieve ARN for queue: ${name}`);
+
+    queueArns.set(name, mainArn);
     console.log(`  ✓ ${name}  →  DLQ: ${dlqName}`);
   }
+
+  return queueArns;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,10 +183,110 @@ async function createSqsQueuesWithDlqs(): Promise<void> {
 async function createEventBridgeBuses(): Promise<void> {
   console.log("\nCreating EventBridge buses...");
   for (const name of EVENT_BUSES) {
-    const { EventBusArn } = await eb.send(
-      new CreateEventBusCommand({ Name: name }),
+    try {
+      const { EventBusArn } = await eb.send(new CreateEventBusCommand({ Name: name }));
+      console.log(`  ✓ ${name}  →  ${EventBusArn}`);
+    } catch (err) {
+      // Idempotent: if the bus already exists (e.g. LocalStack retained state
+      // between runs), treat it as success. Any other error is re-thrown.
+      if ((err as { name?: string }).name === "ResourceAlreadyExistsException") {
+        console.log(`  ✓ ${name}  (already exists)`);
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SNS → SQS subscriptions + filter policies
+//
+// SNS FILTER POLICIES (used here)
+//   Match on message *attributes* — the key-value metadata set in MessageAttributes
+//   at publish time, evaluated by SNS BEFORE the message enters the SQS queue.
+//   A non-matching message is never enqueued; the consumer never sees it and is
+//   never billed for it.
+//
+//   Expressiveness: string exact match, prefix, suffix, numeric range,
+//   anything-but. Operates only on flat attribute values — cannot navigate into
+//   the message body.
+//
+//   Best for: routing dimensions that are known at publish time and fit naturally
+//   into message attributes: tenantTier, region, eventType, priority, source service.
+//
+// EVENTBRIDGE RULES (campaign-bus, wired separately)
+//   Match on the event *body* — arbitrary nested JSON fields in detail.* — and
+//   on event metadata (source, detail-type, account, region).
+//
+//   Expressiveness: same operators as SNS filters PLUS: nested field access,
+//   anything-but arrays, IP CIDR ranges, exists/not-exists on optional fields,
+//   and complex AND combinations across multiple fields.
+//
+//   Cost model: you pay per event that enters the bus regardless of whether a
+//   rule matches. Rules that match incur a small per-invocation charge.
+//
+//   Best for: routing that requires inspecting the body (e.g. "only route events
+//   where detail.campaign.type = 'email' AND detail.audienceSize > 1000"), or
+//   combining body conditions with metadata conditions.
+//
+// Why this project uses BOTH:
+//   SNS filter → tenantTier on the notifier subscription.
+//     tenantTier is already published as a message attribute (campaignPublisher.ts)
+//     so SNS can filter without deserialising the body. Fast, cheap, zero consumer cost.
+//   EventBridge → future rules on campaign-bus such as "only route campaign-activated
+//     to the billing service". The billing rule needs detail.campaignType AND the
+//     event type — a body+metadata combination that SNS attributes cannot express.
+//
+// Production note: in real AWS each SQS queue needs an access policy granting
+//   sns.amazonaws.com permission to call sqs:SendMessage from the topic ARN.
+//   LocalStack does not enforce this policy, so it is omitted here to keep the
+//   local setup simple. Add it before deploying to a real AWS account.
+// ---------------------------------------------------------------------------
+
+// "Paid" tiers receive notification messages. Free tier does not.
+// This filter is enforced at the broker — free-tier events never enter the
+// campaign-notifier queue, so the consumer processes zero extra messages for them.
+const PAID_TIERS = ["pro", "enterprise"] as const;
+
+async function createSnsSubscriptions(
+  topicArns: Map<string, string>,
+  queueArns: Map<string, string>,
+): Promise<void> {
+  console.log("\nCreating SNS → SQS subscriptions...");
+
+  const createdTopicArn = topicArns.get("campaign-created");
+  if (!createdTopicArn) throw new Error("campaign-created topic ARN not found");
+
+  for (const [queueName, queueArn] of queueArns) {
+    // campaign-notifier only receives events from paid-tier tenants.
+    // All other queues receive every event regardless of tenantTier.
+    const filterPolicy =
+      queueName === "campaign-notifier"
+        ? JSON.stringify({ tenantTier: [...PAID_TIERS] })
+        : undefined;
+
+    await sns.send(
+      new SubscribeCommand({
+        TopicArn: createdTopicArn,
+        Protocol: "sqs",
+        // SNS subscriptions require the queue ARN, not the queue URL.
+        Endpoint: queueArn,
+        Attributes: {
+          // FilterPolicyScope defaults to MessageAttributes (not MessageBody),
+          // matching against the flat MessageAttributes map set at publish time.
+          ...(filterPolicy !== undefined && {
+            FilterPolicy: filterPolicy,
+            FilterPolicyScope: "MessageAttributes",
+          }),
+        },
+      }),
     );
-    console.log(`  ✓ ${name}  →  ${EventBusArn}`);
+
+    const filterNote =
+      queueName === "campaign-notifier"
+        ? `  [filter: tenantTier ∈ {${PAID_TIERS.join(", ")}}]`
+        : "  [no filter — receives all tiers]";
+    console.log(`  ✓ campaign-created → ${queueName}${filterNote}`);
   }
 }
 
@@ -190,33 +307,41 @@ async function createEventBridgeBuses(): Promise<void> {
 async function createDynamoTables(): Promise<void> {
   console.log("\nCreating DynamoDB tables...");
 
-  await dynamo.send(
-    new CreateTableCommand({
-      TableName: "Campaigns",
-      BillingMode: BillingMode.PAY_PER_REQUEST,
-      KeySchema: [
-        { AttributeName: "pk", KeyType: "HASH" },
-        { AttributeName: "sk", KeyType: "RANGE" },
-      ],
-      AttributeDefinitions: [
-        { AttributeName: "pk", AttributeType: "S" },
-        { AttributeName: "sk", AttributeType: "S" },
-      ],
-      // GSI for querying by status + createdAt
-      GlobalSecondaryIndexes: [
-        {
-          IndexName: "StatusCreatedAtIndex",
-          KeySchema: [
-            { AttributeName: "sk", KeyType: "HASH" },
-            { AttributeName: "pk", KeyType: "RANGE" },
-          ],
-          Projection: { ProjectionType: "ALL" },
-        },
-      ],
-    }),
-  );
-
-  console.log("  ✓ Campaigns");
+  try {
+    await dynamo.send(
+      new CreateTableCommand({
+        TableName: "Campaigns",
+        BillingMode: BillingMode.PAY_PER_REQUEST,
+        KeySchema: [
+          { AttributeName: "pk", KeyType: "HASH" },
+          { AttributeName: "sk", KeyType: "RANGE" },
+        ],
+        AttributeDefinitions: [
+          { AttributeName: "pk", AttributeType: "S" },
+          { AttributeName: "sk", AttributeType: "S" },
+        ],
+        // GSI for querying by status + createdAt
+        GlobalSecondaryIndexes: [
+          {
+            IndexName: "StatusCreatedAtIndex",
+            KeySchema: [
+              { AttributeName: "sk", KeyType: "HASH" },
+              { AttributeName: "pk", KeyType: "RANGE" },
+            ],
+            Projection: { ProjectionType: "ALL" },
+          },
+        ],
+      }),
+    );
+    console.log("  ✓ Campaigns");
+  } catch (err) {
+    // Idempotent: table already exists from a previous run.
+    if ((err as { name?: string }).name === "ResourceInUseException") {
+      console.log("  ✓ Campaigns  (already exists)");
+    } else {
+      throw err;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,10 +351,11 @@ async function createDynamoTables(): Promise<void> {
 async function main(): Promise<void> {
   console.log(`Connecting to LocalStack at ${LOCALSTACK_ENDPOINT}\n`);
 
-  await createSnsTopics();
-  await createSqsQueuesWithDlqs();
+  const topicArns = await createSnsTopics();
+  const queueArns = await createSqsQueuesWithDlqs();
   await createEventBridgeBuses();
   await createDynamoTables();
+  await createSnsSubscriptions(topicArns, queueArns);
 
   console.log("\nInfrastructure setup complete.");
 }

@@ -102,3 +102,24 @@ for fast processors; increase per-queue as processing time grows.
 
 **Trade-offs:**
 - Callers must not return a failure for a message they partially processed — that would re-deliver a message whose side effects are already partially applied. All side effects must be atomic or idempotent before returning success.
+
+---
+
+### 2026-06-08 — SNS subscription filter policies and idempotent infra:setup
+
+**Decision:** Apply SNS subscription filter `{ tenantTier: ["pro", "enterprise"] }` to the `campaign-notifier` subscription; all other queue subscriptions carry no filter.
+
+**Why:** The notifier sends push/SMS notifications, a paid-tier feature. Free-tier tenants generating campaign events should never trigger notification delivery. Enforcing this at the SNS broker (before the message enters the queue) means the `NotificationConsumer` receives zero free-tier messages and incurs zero processing cost for them. The alternative — receiving all messages and skipping in the consumer — wastes ReceiveMessage API calls, increases queue depth metrics, and requires consumer logic to know about tier rules.
+
+**Trade-offs:**
+- The filter operates on message *attributes*, not the body. The `tenantTier` attribute must be set at publish time (done in `campaignPublisher.ts`). Any producer that omits this attribute will have its messages filtered out entirely (SNS treats a missing attribute as non-matching), which may or may not be the desired behaviour.
+- Adding a new paid-tier value (e.g. `"enterprise-plus"`) requires updating the filter policy on the subscription, not just the schema. Infrastructure and code must stay in sync.
+- `FilterPolicyScope: "MessageAttributes"` is the default. Using `"MessageBody"` instead would allow filtering on JSON body fields but adds SNS parsing overhead and couples the filter to the body schema.
+
+**Decision:** Make `infra:setup` idempotent by catching "already exists" errors in `createEventBridgeBuses` and `createDynamoTables`.
+
+**Why:** LocalStack persists EventBridge buses and DynamoDB tables across some container restarts (even with `PERSISTENCE: 0`). Without idempotency, re-running `infra:setup` after a partial restart fails partway through, leaving subscriptions uncreated. Making each creation step safe to re-run means `infra:setup` is a reliable "ensure everything exists" command rather than a one-shot bootstrap.
+
+**Trade-offs:**
+- SNS `CreateTopic` and SQS `CreateQueue` are already idempotent by the AWS API contract (they return the existing resource on duplicate calls). Only EventBridge and DynamoDB required explicit error handling.
+- Idempotent `infra:setup` does not clean up stale resources from a previous schema version — that requires a separate teardown or migration step.

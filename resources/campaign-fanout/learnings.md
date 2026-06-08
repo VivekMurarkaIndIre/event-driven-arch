@@ -104,3 +104,14 @@
   `| undefined` only to index-signature access (`arr[i]`), not to `for...of` iteration
   variables. Iterating with `for (const item of arr)` gives `item: T`, not `item: T | undefined`,
   so no extra guards are needed inside loop bodies.
+
+### 2026-06-08
+- **SNS filter policies match on attributes, not the body — and a missing attribute counts as non-matching.** If a producer publishes without setting `tenantTier` as a `MessageAttribute`, SNS evaluates the filter and finds no value to compare against. The message is silently dropped for that subscription. This is the correct behaviour for a badly-behaved producer, but it can surprise you during development if you forget to set the attribute.
+
+- **`FilterPolicyScope` must be `"MessageAttributes"` (not `"MessageBody"`) when filtering on MessageAttributes.** The default is `MessageAttributes`, but specifying it explicitly in the `SubscribeCommand.Attributes` makes the intent clear and avoids confusion if the default ever changes.
+
+- **SNS `SubscribeCommand` requires the queue ARN as `Endpoint`, not the queue URL.** Using the queue URL returns a validation error. The ARN must be retrieved via `GetQueueAttributes` after creation — it is not returned by `CreateQueue`. This is the same pattern used for the DLQ ARN in the redrive policy.
+
+- **LocalStack `ResourceAlreadyExistsException` vs `ResourceInUseException`.** EventBridge throws `ResourceAlreadyExistsException`; DynamoDB throws `ResourceInUseException`. The error names are inconsistent across services — check the `err.name` field rather than the message string, and handle each service separately.
+
+- **SNS `CreateTopic` and SQS `CreateQueue` are idempotent by the AWS API contract.** Calling them with the same name when the resource already exists returns the existing ARN/URL rather than an error. This makes topics and queues easy to provision safely on every deploy without explicit existence checks. EventBridge and DynamoDB do not share this property.
